@@ -192,9 +192,9 @@ class ConflictResolutionMetrics:
             self.real_operation_success_by_type[op_type] += 1
             if op_type in ['version_entity', 'entity_versioning']:
                 self.versioning_operations += 1
-            elif op_type in ['borrow_attribute_from', 'borrowing']:
+            elif op_type in ['borrow_attribute']:  # FIXED: use correct operation type
                 self.borrowing_operations += 1
-            elif op_type in ['promote_to_root', 'detach', 'structural']:
+            elif op_type in ['promote_to_root', 'detach_entity', 'structural']:  # FIXED: use correct operation type
                 self.structural_operations += 1
             self.entity_modifications += 1
         else:
@@ -822,11 +822,11 @@ class ConflictResolutionTest:
                                             self.submitted_operations.discard(op_id)
                                             self.metrics.record_operation_rejected(op.priority)
                                 
-                                # Clean up rejected operations
+                                # Clean up rejected operations - NO double counting
                                 elif op.status == OperationStatus.REJECTED:
                                     self.grace_tracker.end_grace_period(op.ecs_id)
                                     self.submitted_operations.discard(op_id)
-                                    self.metrics.record_operation_rejected(op.priority)
+                                    # DON'T record_operation_rejected here - already counted in conflict resolution
                                 
                                 # Handle failed operations - try to retry them
                                 elif op.status == OperationStatus.FAILED:
@@ -988,21 +988,33 @@ class ConflictResolutionTest:
             success_rate = (success_count / count * 100) if count > 0 else 0
             print(f"       ├─ {op_type}: {count} total, {success_count} successful ({success_rate:.1f}%)")
         
-        # Operation accounting verification
-        total_accounted = (self.metrics.operations_completed + 
-                          self.metrics.operations_rejected + 
-                          self.metrics.operations_failed + 
-                          self.metrics.operations_in_progress)
-        unaccounted = self.metrics.operations_submitted - total_accounted
+        # Operation accounting verification - FIXED to avoid double counting
+        # Only count final states, not intermediate transitions
+        operations_in_final_state = (self.metrics.operations_completed + 
+                                    self.metrics.operations_rejected + 
+                                    self.metrics.operations_in_progress)
+        # Note: operations_failed are typically retried and eventually completed or rejected
+        # So we don't count them separately to avoid double-counting
         
-        print(f"\n📊 Operation Accounting:")
+        unaccounted = self.metrics.operations_submitted - operations_in_final_state
+        
+        print(f"\n📊 Operation Accounting (Fixed):")
         print(f"   ├─ Total submitted: {self.metrics.operations_submitted}")
-        print(f"   ├─ Total accounted: {total_accounted}")
+        print(f"   ├─ Final state count: {operations_in_final_state}")
+        print(f"   │  ├─ Completed: {self.metrics.operations_completed}")
+        print(f"   │  ├─ Rejected: {self.metrics.operations_rejected}")
+        print(f"   │  └─ In progress: {self.metrics.operations_in_progress}")
         print(f"   ├─ Unaccounted: {unaccounted}")
+        print(f"   └─ Transition metrics (not counted in final):")
+        print(f"      ├─ Failed (retried): {self.metrics.operations_failed}")
+        print(f"      └─ Retried: {self.metrics.operations_retried}")
+        
         if unaccounted > 0:
-            print(f"   └─ ⚠️  {unaccounted} operations may be stuck in PENDING state")
+            print(f"   ⚠️  {unaccounted} operations may be stuck in PENDING state")
+        elif unaccounted < 0:
+            print(f"   ⚠️  {abs(unaccounted)} operations were double-counted (likely rejected operations)")
         else:
-            print(f"   └─ ✅ All operations accounted for")
+            print(f"   ✅ All operations properly accounted for")
         
         print(f"\n🛡️  Grace Period Results:")
         print(f"   ├─ Grace period saves: {self.metrics.grace_period_saves}")
