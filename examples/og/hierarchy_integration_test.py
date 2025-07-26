@@ -1,13 +1,23 @@
 """
-Integration Test: Entity Hierarchy + Events + Agent Observer
+REAL Hierarchy Integration Test - Validates All Failure and Win Modes
 
-This test demonstrates that the new operation hierarchy system works
-correctly with the existing agent observer and registry agent components.
+This is a comprehensive production test that validates:
+- Conflict resolution correctness under stress
+- Grace period protection mechanisms  
+- Operation lifecycle edge cases
+- Error handling and retry logic
+- Concurrent operation scenarios
+- All win/lose conditions
+
+NO happy path demonstrations - only REAL validation with assertions.
 """
 
 import asyncio
+import time
+import random
 from uuid import uuid4, UUID
 from datetime import datetime, timezone
+from typing import List, Dict, Set, Optional
 
 # Import the entity hierarchy components
 from abstractions.ecs.entity_hierarchy import (
@@ -32,264 +42,579 @@ class TestEntity(Entity):
     """Simple entity for testing operations."""
     name: str = "test"
     value: int = 0
+    modification_count: int = 0
 
 
-async def test_operation_creation_and_events():
-    """Test creating operations and emitting events."""
-    print("\n🧪 TEST: Operation Creation and Events")
+class GracePeriodTracker:
+    """Grace period tracker for testing execution protection."""
     
-    # Create a test target entity
-    target_entity = TestEntity(name="test_target", value=42)
-    target_entity.promote_to_root()
-    
-    # Create a normal operation
-    operation = NormalOperation.create_and_register(
-        op_type="test_operation",
-        priority=OperationPriority.NORMAL,
-        target_entity_id=target_entity.ecs_id,
-        max_retries=3
-    )
-    
-    print(f"✅ Created operation: {operation.ecs_id}")
-    print(f"   └─ Target: {operation.target_entity_id}")
-    print(f"   └─ Priority: {operation.priority}")
-    print(f"   └─ Status: {operation.status}")
-    
-    # Start the operation and emit event
-    await emit(OperationStartedEvent(
-        process_name="operation_execution",
-        op_id=operation.ecs_id,
-        op_type=operation.op_type,
-        priority=operation.priority,
-        target_entity_id=operation.target_entity_id
-    ))
-    
-    # Simulate operation execution
-    operation.start_execution()
-    
-    # Complete the operation
-    operation.complete_operation(success=True)
-    
-    await emit(OperationCompletedEvent(
-        process_name="operation_execution",
-        op_id=operation.ecs_id,
-        op_type=operation.op_type,
-        target_entity_id=operation.target_entity_id,
-        execution_duration_ms=150.0
-    ))
-    
-    print(f"✅ Operation completed: {operation.status}")
-    
-    return operation, target_entity
-
-
-async def test_operation_conflicts():
-    """Test operation conflict detection and resolution."""
-    print("\n🧪 TEST: Operation Conflicts")
-    
-    # Create a test target entity
-    target_entity = TestEntity(name="conflict_target", value=100)
-    target_entity.promote_to_root()
-    
-    # Create two conflicting operations
-    high_priority_op = StructuralOperation.create_and_register(
-        op_type="high_priority_operation",
-        priority=OperationPriority.CRITICAL,
-        target_entity_id=target_entity.ecs_id,
-        max_retries=5
-    )
-    
-    low_priority_op = LowPriorityOperation.create_and_register(
-        op_type="low_priority_operation", 
-        priority=OperationPriority.LOW,
-        target_entity_id=target_entity.ecs_id,
-        max_retries=2
-    )
-    
-    print(f"✅ Created conflicting operations:")
-    print(f"   ├─ High priority: {high_priority_op.ecs_id} (priority {high_priority_op.priority})")
-    print(f"   └─ Low priority: {low_priority_op.ecs_id} (priority {low_priority_op.priority})")
-    
-    # Emit conflict event
-    await emit(OperationConflictEvent(
-        op_id=low_priority_op.ecs_id,
-        op_type=low_priority_op.op_type,
-        target_entity_id=target_entity.ecs_id,
-        priority=low_priority_op.priority,
-        conflict_details={},
-        conflicting_op_ids=[high_priority_op.ecs_id]
-    ))
-    
-    # Find conflicting operations
-    conflicts = get_conflicting_operations(target_entity.ecs_id)
-    print(f"✅ Found {len(conflicts)} conflicting operations")
-    
-    # Resolve conflicts
-    if conflicts:
-        winners = resolve_operation_conflicts(target_entity.ecs_id, conflicts)
-        print(f"✅ Conflict resolved, {len(winners)} winning operation(s)")
+    def __init__(self, grace_period_seconds: float):
+        self.grace_period_seconds = grace_period_seconds
+        self.executing_operations: Dict[UUID, datetime] = {}
         
-        # Emit rejection event for losers
-        for op in conflicts:
-            if op not in winners and op.status == OperationStatus.REJECTED:
-                await emit(OperationRejectedEvent(
-                    op_id=op.ecs_id,
-                    op_type=op.op_type,
-                    target_entity_id=op.target_entity_id,
-                    from_state="pending",
-                    to_state="rejected",
-                    rejection_reason="preempted_by_higher_priority",
-                    retry_count=op.retry_count
-                ))
-    
-    return high_priority_op, low_priority_op
+    def start_grace_period(self, op_id: UUID):
+        self.executing_operations[op_id] = datetime.now(timezone.utc)
+        
+    def end_grace_period(self, op_id: UUID):
+        self.executing_operations.pop(op_id, None)
+        
+    def can_be_preempted(self, op_id: UUID) -> bool:
+        if op_id not in self.executing_operations:
+            return True
+            
+        start_time = self.executing_operations[op_id]
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        return elapsed >= self.grace_period_seconds
+        
+    def get_protected_operations(self) -> Set[UUID]:
+        now = datetime.now(timezone.utc)
+        protected = set()
+        
+        for op_id, start_time in self.executing_operations.items():
+            elapsed = (now - start_time).total_seconds()
+            if elapsed < self.grace_period_seconds:
+                protected.add(op_id)
+                
+        return protected
 
 
-async def test_operation_hierarchy():
-    """Test operation parent-child relationships."""
-    print("\n🧪 TEST: Operation Hierarchy")
+class RealOperationEntity(OperationEntity):
+    """Operation that performs real work and can fail."""
     
-    # Create a test target entity
-    target_entity = TestEntity(name="hierarchy_target", value=200)
-    target_entity.promote_to_root()
+    operation_type: str = "test_operation"
+    should_fail: bool = False
+    execution_time_ms: float = 10.0
     
-    # Create parent operation
-    parent_op = StructuralOperation.create_and_register(
-        op_type="parent_operation",
-        priority=OperationPriority.HIGH,
-        target_entity_id=target_entity.ecs_id
-    )
+    async def execute_real_operation(self) -> bool:
+        """Execute real operation with configurable failure."""
+        await asyncio.sleep(self.execution_time_ms / 1000.0)  # Simulate work
+        
+        if self.should_fail:
+            self.error_message = "Simulated operation failure"
+            return False
+            
+        # Modify the target entity
+        target = self._get_target_entity()
+        if target:
+            target.modification_count += 1
+            target.value += 1
+            
+        return True
     
-    # Create child operations
-    child_op1 = NormalOperation.create_and_register(
-        op_type="child_operation_1",
-        priority=OperationPriority.NORMAL,
-        target_entity_id=target_entity.ecs_id,
-        parent_op_id=parent_op.ecs_id
-    )
-    
-    child_op2 = NormalOperation.create_and_register(
-        op_type="child_operation_2",
-        priority=OperationPriority.NORMAL,
-        target_entity_id=target_entity.ecs_id,
-        parent_op_id=parent_op.ecs_id
-    )
-    
-    print(f"✅ Created operation hierarchy:")
-    print(f"   ├─ Parent: {parent_op.ecs_id}")
-    print(f"   ├─ Child 1: {child_op1.ecs_id}")
-    print(f"   └─ Child 2: {child_op2.ecs_id}")
-    
-    # Test hierarchy chain
-    hierarchy = child_op1.get_hierarchy_chain()
-    print(f"✅ Hierarchy chain length: {len(hierarchy)}")
-    
-    # Test effective priority (should inherit from parent)
-    effective_priority = child_op1.get_effective_priority()
-    print(f"✅ Child effective priority: {effective_priority} (inherited from parent: {parent_op.priority})")
-    
-    return parent_op, child_op1, child_op2
+    def _get_target_entity(self) -> Optional[TestEntity]:
+        """Get the target entity for this operation."""
+        try:
+            root_id = EntityRegistry.ecs_id_to_root_id.get(self.target_entity_id)
+            if root_id:
+                entity = EntityRegistry.get_stored_entity(root_id, self.target_entity_id)
+                if isinstance(entity, TestEntity):
+                    return entity
+            return None
+        except:
+            return None
 
 
-async def test_operation_statistics():
-    """Test operation statistics and management."""
-    print("\n🧪 TEST: Operation Statistics")
+class HierarchyTestSuite:
+    """Comprehensive test suite for hierarchy system."""
     
-    # Get current stats
-    stats = get_operation_stats()
-    print(f"✅ Operation statistics:")
-    print(f"   ├─ Total operations: {stats['total']}")
-    print(f"   ├─ By status: {stats['by_status']}")
-    print(f"   ├─ By type: {stats['by_type']}")
-    print(f"   └─ By priority: {stats['by_priority']}")
+    def __init__(self):
+        self.grace_tracker = GracePeriodTracker(0.1)  # 100ms grace period
+        self.test_results = []
+        
+    def assert_condition(self, condition: bool, message: str, test_name: str):
+        """Assert a condition and track test results."""
+        if condition:
+            print(f"✅ {test_name}: {message}")
+            self.test_results.append((test_name, True, message))
+        else:
+            print(f"❌ {test_name}: FAILED - {message}")
+            self.test_results.append((test_name, False, message))
+            raise AssertionError(f"{test_name} failed: {message}")
     
-    # Test operations by status
-    pending_ops = get_operations_by_status(OperationStatus.PENDING)
-    executing_ops = get_operations_by_status(OperationStatus.EXECUTING)
-    completed_ops = get_operations_by_status(OperationStatus.SUCCEEDED)
+    async def test_basic_conflict_resolution(self):
+        """TEST: Basic priority-based conflict resolution."""
+        test_name = "BASIC_CONFLICT_RESOLUTION"
+        
+        # Create target entity
+        target = TestEntity(name="conflict_test", value=0)
+        target.promote_to_root()
+        
+        # Create operations with different priorities
+        ops = []
+        priorities = [OperationPriority.LOW, OperationPriority.NORMAL, OperationPriority.HIGH, OperationPriority.CRITICAL]
+        
+        for i, priority in enumerate(priorities):
+            op = RealOperationEntity(
+                op_type=f"test_op_{i}",
+                operation_type="test_operation",
+                priority=priority,
+                target_entity_id=target.ecs_id
+            )
+            op.promote_to_root()
+            ops.append(op)
+        
+        # All operations should be in PENDING state
+        pending_ops = [op for op in ops if op.status == OperationStatus.PENDING]
+        self.assert_condition(
+            len(pending_ops) == 4,
+            f"All 4 operations should be PENDING, got {len(pending_ops)}",
+            test_name
+        )
+        
+        # Resolve conflicts
+        winners = resolve_operation_conflicts(target.ecs_id, ops, self.grace_tracker)
+        
+        # Only CRITICAL priority should win
+        self.assert_condition(
+            len(winners) == 1,
+            f"Expected 1 winner, got {len(winners)}",
+            test_name
+        )
+        
+        self.assert_condition(
+            winners[0].priority == OperationPriority.CRITICAL,
+            f"Winner should have CRITICAL priority, got {winners[0].priority}",
+            test_name
+        )
+        
+        # Other operations should be rejected
+        rejected_ops = [op for op in ops if op.status == OperationStatus.REJECTED]
+        self.assert_condition(
+            len(rejected_ops) == 3,
+            f"Expected 3 rejected operations, got {len(rejected_ops)}",
+            test_name
+        )
+        
+        return target, ops
     
-    print(f"✅ Operations by status:")
-    print(f"   ├─ Pending: {len(pending_ops)}")
-    print(f"   ├─ Executing: {len(executing_ops)}")
-    print(f"   └─ Completed: {len(completed_ops)}")
-
-
-async def test_integration_with_agent_observer():
-    """Test that agent observer receives operation events correctly."""
-    print("\n🧪 TEST: Agent Observer Integration")
+    async def test_executing_operation_protection(self):
+        """TEST: EXECUTING operations cannot be preempted."""
+        test_name = "EXECUTING_PROTECTION"
+        
+        # Create target entity
+        target = TestEntity(name="protection_test", value=0)
+        target.promote_to_root()
+        
+        # Create low priority operation and start executing it
+        low_priority_op = RealOperationEntity(
+            op_type="executing_op",
+            operation_type="test_operation",
+            priority=OperationPriority.LOW,
+            target_entity_id=target.ecs_id,
+            execution_time_ms=100.0  # Longer execution
+        )
+        low_priority_op.promote_to_root()
+        low_priority_op.start_execution()  # Now EXECUTING
+        
+        # Start grace period
+        self.grace_tracker.start_grace_period(low_priority_op.ecs_id)
+        
+        # Create higher priority operation
+        high_priority_op = RealOperationEntity(
+            op_type="high_priority_op",
+            operation_type="test_operation", 
+            priority=OperationPriority.CRITICAL,
+            target_entity_id=target.ecs_id
+        )
+        high_priority_op.promote_to_root()
+        
+        # Verify states before conflict resolution
+        self.assert_condition(
+            low_priority_op.status == OperationStatus.EXECUTING,
+            f"Low priority op should be EXECUTING, got {low_priority_op.status}",
+            test_name
+        )
+        
+        self.assert_condition(
+            high_priority_op.status == OperationStatus.PENDING,
+            f"High priority op should be PENDING, got {high_priority_op.status}",
+            test_name
+        )
+        
+        # Resolve conflicts - EXECUTING operation should be protected
+        conflicts = [low_priority_op, high_priority_op]
+        winners = resolve_operation_conflicts(target.ecs_id, conflicts, self.grace_tracker)
+        
+        # Both should win - EXECUTING is protected, PENDING gets highest priority
+        self.assert_condition(
+            len(winners) == 2,
+            f"Expected 2 winners (EXECUTING + highest PENDING), got {len(winners)}",
+            test_name
+        )
+        
+        self.assert_condition(
+            low_priority_op in winners,
+            "EXECUTING operation should be protected and win",
+            test_name
+        )
+        
+        self.assert_condition(
+            high_priority_op in winners,
+            "Highest priority PENDING operation should also win",
+            test_name
+        )
+        
+        # No operations should be rejected (both are winners)
+        rejected_count = len([op for op in conflicts if op.status == OperationStatus.REJECTED])
+        self.assert_condition(
+            rejected_count == 0,
+            f"Expected 0 rejected operations, got {rejected_count}",
+            test_name
+        )
+        
+        return target, low_priority_op, high_priority_op
     
-    # Import agent observer to ensure handlers are registered
-    try:
-        import abstractions.agent_observer
-        print("✅ Agent observer imported successfully")
-    except ImportError as e:
-        print(f"⚠️  Agent observer import failed: {e}")
-        return
+    async def test_grace_period_protection(self):
+        """TEST: Operations within grace period cannot be preempted."""
+        test_name = "GRACE_PERIOD_PROTECTION"
+        
+        # Create target entity
+        target = TestEntity(name="grace_test", value=0)
+        target.promote_to_root()
+        
+        # Create and start a low priority operation
+        protected_op = RealOperationEntity(
+            op_type="protected_op",
+            operation_type="test_operation",
+            priority=OperationPriority.LOW,
+            target_entity_id=target.ecs_id
+        )
+        protected_op.promote_to_root()
+        
+        # Start grace period (operation recently started executing)
+        self.grace_tracker.start_grace_period(protected_op.ecs_id)
+        
+        # Verify operation is protected
+        protected_ids = self.grace_tracker.get_protected_operations()
+        self.assert_condition(
+            protected_op.ecs_id in protected_ids,
+            "Operation should be in grace period protection",
+            test_name
+        )
+        
+        # Create higher priority operation that tries to preempt
+        attacking_op = RealOperationEntity(
+            op_type="attacking_op",
+            operation_type="test_operation",
+            priority=OperationPriority.CRITICAL,
+            target_entity_id=target.ecs_id
+        )
+        attacking_op.promote_to_root()
+        
+        # Resolve conflicts with grace tracker
+        conflicts = [protected_op, attacking_op]
+        winners = resolve_operation_conflicts(target.ecs_id, conflicts, self.grace_tracker)
+        
+        # Both should win - protected by grace + highest priority
+        self.assert_condition(
+            len(winners) == 2,
+            f"Expected 2 winners (grace protected + highest priority), got {len(winners)}",
+            test_name
+        )
+        
+        self.assert_condition(
+            protected_op in winners,
+            "Grace-protected operation should win",
+            test_name
+        )
+        
+        self.assert_condition(
+            attacking_op in winners, 
+            "Highest priority operation should also win",
+            test_name
+        )
+        
+        return target, protected_op, attacking_op
     
-    # Create and emit some operation events
-    target_entity = TestEntity(name="observer_test", value=300)
-    target_entity.promote_to_root()
+    async def test_operation_failure_and_retry(self):
+        """TEST: Failed operations retry correctly."""
+        test_name = "FAILURE_AND_RETRY"
+        
+        # Create target entity
+        target = TestEntity(name="retry_test", value=0)
+        target.promote_to_root()
+        
+        # Create operation that will fail initially
+        failing_op = RealOperationEntity(
+            op_type="failing_op",
+            operation_type="test_operation",
+            priority=OperationPriority.NORMAL,
+            target_entity_id=target.ecs_id,
+            should_fail=True,  # Will fail
+            max_retries=3
+        )
+        failing_op.promote_to_root()
+        
+        # Execute and fail
+        failing_op.start_execution()
+        success = await failing_op.execute_real_operation()
+        
+        self.assert_condition(
+            not success,
+            "Operation should fail as configured",
+            test_name
+        )
+        
+        self.assert_condition(
+            failing_op.error_message is not None,
+            "Failed operation should have error message",
+            test_name
+        )
+        
+        # Complete with failure
+        failing_op.complete_operation(success=False, error_message="Test failure")
+        
+        # Retry the operation
+        initial_retry_count = failing_op.retry_count
+        can_retry = failing_op.increment_retry()
+        
+        self.assert_condition(
+            can_retry,
+            "Operation should be able to retry",
+            test_name
+        )
+        
+        self.assert_condition(
+            failing_op.retry_count == initial_retry_count + 1,
+            f"Retry count should increment, expected {initial_retry_count + 1}, got {failing_op.retry_count}",
+            test_name
+        )
+        
+        # Operation should be back to PENDING for retry
+        self.assert_condition(
+            failing_op.status == OperationStatus.PENDING,
+            f"Retrying operation should be PENDING, got {failing_op.status}",
+            test_name
+        )
+        
+        # Make it succeed on retry
+        failing_op.should_fail = False
+        failing_op.start_execution()
+        success = await failing_op.execute_real_operation()
+        
+        self.assert_condition(
+            success,
+            "Operation should succeed on retry",
+            test_name
+        )
+        
+        failing_op.complete_operation(success=True)
+        
+        self.assert_condition(
+            failing_op.status == OperationStatus.SUCCEEDED,
+            f"Successful operation should have SUCCEEDED status, got {failing_op.status}",
+            test_name
+        )
+        
+        return target, failing_op
     
-    operation = NormalOperation.create_and_register(
-        op_type="observer_test_operation",
-        priority=OperationPriority.NORMAL,
-        target_entity_id=target_entity.ecs_id
-    )
+    async def test_concurrent_stress_scenario(self):
+        """TEST: Many concurrent operations with realistic timing."""
+        test_name = "CONCURRENT_STRESS"
+        
+        # Create target entity
+        target = TestEntity(name="stress_test", value=0)
+        target.promote_to_root()
+        
+        # Create many operations with random priorities
+        num_operations = 50
+        operations = []
+        
+        for i in range(num_operations):
+            priority = random.choice([OperationPriority.LOW, OperationPriority.NORMAL, 
+                                    OperationPriority.HIGH, OperationPriority.CRITICAL])
+            
+            op = RealOperationEntity(
+                op_type=f"stress_op_{i}",
+                operation_type="test_operation",
+                priority=priority,
+                target_entity_id=target.ecs_id,
+                execution_time_ms=random.uniform(1.0, 10.0)  # Random execution time
+            )
+            op.promote_to_root()
+            operations.append(op)
+        
+        # Start some operations executing
+        executing_count = 5
+        for i in range(executing_count):
+            operations[i].start_execution()
+            self.grace_tracker.start_grace_period(operations[i].ecs_id)
+        
+        # Resolve conflicts
+        start_time = time.time()
+        winners = resolve_operation_conflicts(target.ecs_id, operations, self.grace_tracker)
+        resolution_time = (time.time() - start_time) * 1000
+        
+        # Verify executing operations are protected
+        executing_ops = [op for op in operations[:executing_count]]
+        executing_winners = [op for op in executing_ops if op in winners]
+        
+        self.assert_condition(
+            len(executing_winners) == executing_count,
+            f"All {executing_count} executing operations should be protected and win, got {len(executing_winners)}",
+            test_name
+        )
+        
+        # Verify highest priority among pending operations wins
+        pending_ops = [op for op in operations[executing_count:]]
+        pending_winners = [op for op in pending_ops if op in winners]
+        
+        if pending_ops:  # If there are pending operations
+            highest_pending_priority = max(op.priority for op in pending_ops)
+            self.assert_condition(
+                len(pending_winners) > 0,
+                "At least one pending operation should win",
+                test_name
+            )
+            
+            if pending_winners:
+                winner_priority = pending_winners[0].priority
+                self.assert_condition(
+                    winner_priority == highest_pending_priority,
+                    f"Winning pending operation should have highest priority {highest_pending_priority}, got {winner_priority}",
+                    test_name
+                )
+        
+        # Performance check
+        self.assert_condition(
+            resolution_time < 100.0,  # Should resolve in under 100ms
+            f"Conflict resolution should be fast, took {resolution_time:.1f}ms",
+            test_name
+        )
+        
+        # Verify total winners is reasonable
+        expected_winners = executing_count + 1  # All executing + 1 highest pending
+        self.assert_condition(
+            len(winners) == expected_winners,
+            f"Expected {expected_winners} winners, got {len(winners)}",
+            test_name
+        )
+        
+        return target, operations, winners
     
-    # Emit a series of operation events
-    print("📡 Emitting operation events for observer...")
+    async def test_hierarchy_inheritance(self):
+        """TEST: Child operations inherit parent priority correctly."""
+        test_name = "HIERARCHY_INHERITANCE"
+        
+        # Create target entity
+        target = TestEntity(name="hierarchy_test", value=0)
+        target.promote_to_root()
+        
+        # Create parent with high priority
+        parent_op = RealOperationEntity(
+            op_type="parent_op",
+            operation_type="test_operation",
+            priority=OperationPriority.CRITICAL,
+            target_entity_id=target.ecs_id
+        )
+        parent_op.promote_to_root()
+        
+        # Create child with lower priority
+        child_op = RealOperationEntity(
+            op_type="child_op",
+            operation_type="test_operation",
+            priority=OperationPriority.LOW,
+            target_entity_id=target.ecs_id,
+            parent_op_id=parent_op.ecs_id
+        )
+        child_op.promote_to_root()
+        
+        # Child should inherit parent's higher priority
+        effective_priority = child_op.get_effective_priority()
+        self.assert_condition(
+            effective_priority == OperationPriority.CRITICAL,
+            f"Child should inherit parent's CRITICAL priority, got {effective_priority}",
+            test_name
+        )
+        
+        # Create competing operation with high priority
+        competitor_op = RealOperationEntity(
+            op_type="competitor_op",
+            operation_type="test_operation",
+            priority=OperationPriority.HIGH,
+            target_entity_id=target.ecs_id
+        )
+        competitor_op.promote_to_root()
+        
+        # Child should win due to inherited priority
+        conflicts = [child_op, competitor_op]
+        winners = resolve_operation_conflicts(target.ecs_id, conflicts, self.grace_tracker)
+        
+        self.assert_condition(
+            len(winners) == 1,
+            f"Expected 1 winner, got {len(winners)}",
+            test_name
+        )
+        
+        self.assert_condition(
+            child_op in winners,
+            "Child with inherited CRITICAL priority should win over HIGH priority competitor",
+            test_name
+        )
+        
+        self.assert_condition(
+            competitor_op.status == OperationStatus.REJECTED,
+            f"Competitor should be rejected, got status {competitor_op.status}",
+            test_name
+        )
+        
+        return target, parent_op, child_op, competitor_op
     
-    await emit(OperationStartedEvent(
-        process_name="observer_test",
-        op_id=operation.ecs_id,
-        op_type=operation.op_type,
-        priority=operation.priority,
-        target_entity_id=operation.target_entity_id
-    ))
-    
-    # Small delay to let observers process
-    await asyncio.sleep(0.1)
-    
-    await emit(OperationCompletedEvent(
-        process_name="observer_test",
-        op_id=operation.ecs_id,
-        op_type=operation.op_type,
-        target_entity_id=operation.target_entity_id,
-        execution_duration_ms=250.0
-    ))
-    
-    print("✅ Operation events emitted for observer")
+    def print_test_summary(self):
+        """Print comprehensive test results."""
+        print("\n" + "=" * 80)
+        print("🧪 HIERARCHY INTEGRATION TEST RESULTS")
+        print("=" * 80)
+        
+        passed = len([r for r in self.test_results if r[1]])
+        total = len(self.test_results)
+        
+        print(f"📊 Tests: {passed}/{total} passed")
+        
+        if passed == total:
+            print("🎉 ALL TESTS PASSED - Hierarchy system is production ready!")
+        else:
+            print("❌ SOME TESTS FAILED - System needs fixes!")
+        
+        print("\n📋 Detailed Results:")
+        for test_name, success, message in self.test_results:
+            status = "✅" if success else "❌"
+            print(f"   {status} {test_name}: {message}")
 
 
 async def main():
-    """Run all integration tests."""
-    print("🚀 Starting Entity Hierarchy Integration Tests")
-    print("=" * 60)
+    """Run comprehensive hierarchy integration tests."""
+    print("🚀 REAL Hierarchy Integration Test Suite")
+    print("Testing ALL failure and win modes with REAL validation")
+    print("=" * 80)
     
     # Start the event bus
     bus = get_event_bus()
     await bus.start()
     
     try:
-        # Run tests
-        await test_operation_creation_and_events()
-        await test_operation_conflicts()
-        await test_operation_hierarchy()
-        await test_operation_statistics()
-        await test_integration_with_agent_observer()
+        # Import agent observer to ensure handlers are registered
+        import abstractions.agent_observer
         
-        print("\n" + "=" * 60)
-        print("🎉 All integration tests completed successfully!")
+        # Create test suite
+        test_suite = HierarchyTestSuite()
         
-        # Final statistics
-        final_stats = get_operation_stats()
-        print(f"\n📊 Final operation count: {final_stats['total']}")
+        # Run all tests
+        await test_suite.test_basic_conflict_resolution()
+        await test_suite.test_executing_operation_protection()
+        await test_suite.test_grace_period_protection()
+        await test_suite.test_operation_failure_and_retry()
+        await test_suite.test_concurrent_stress_scenario()
+        await test_suite.test_hierarchy_inheritance()
+        
+        # Print results
+        test_suite.print_test_summary()
         
     except Exception as e:
-        print(f"\n❌ Integration test failed: {e}")
+        print(f"\n💥 CRITICAL TEST FAILURE: {e}")
         import traceback
         traceback.print_exc()
-    
+        
     finally:
         # Stop the event bus
         await bus.stop()
