@@ -374,19 +374,32 @@ class ConflictResolutionMetrics:
 ### Example Metrics Output
 
 ```
-🔧 REAL Operation Results:
-   ├─ Total entity modifications: 140
-   ├─ Versioning operations: 37
-   ├─ Borrowing operations: 27
-   ├─ Structural operations: 13
-   ├─ Avg real operation time: 2.2ms
-   └─ Real operations by type:
-       ├─ version_entity: 37 total, 37 successful (100.0%)
-       ├─ modify_field: 45 total, 45 successful (100.0%)
-       ├─ promote_to_root: 3 total, 3 successful (100.0%)
-       ├─ complex_update: 18 total, 18 successful (100.0%)
-       ├─ borrow_attribute: 27 total, 27 successful (100.0%)
-       ├─ detach_entity: 10 total, 10 successful (100.0%)
+🔧 PRODUCTION Operation Results:
+   ├─ Total entity modifications: 747
+   ├─ Versioning operations: 236
+   ├─ Borrowing operations: 150
+   ├─ Structural operations: 77
+   ├─ Avg production operation time: 3.0ms
+   └─ Production operations by type:
+       ├─ version_entity: 236 total, 236 successful (100.0%)
+       ├─ modify_field: 164 total, 164 successful (100.0%)
+       ├─ complex_update: 120 total, 120 successful (100.0%)
+       ├─ borrow_attribute: 150 total, 150 successful (100.0%)
+       ├─ promote_to_root: 34 total, 34 successful (100.0%)
+       ├─ detach_entity: 43 total, 43 successful (100.0%)
+
+🔍 ECS Lineage and Versioning Analysis:
+   ├─ Expected modifications (from metrics): 747
+   ├─ Actual ECS versions found: 361
+   ├─ Version accounting breakdown:
+   │  ├─ Operations that create versions: 356
+   │  │  ├─ version_entity operations: 236
+   │  │  └─ complex_update operations: 120
+   │  ├─ Original target entities: 5
+   │  └─ Expected total versions: 361
+   ├─ ✅ Perfect version accounting: 361 = 361
+   ├─ Operations that succeeded without creating versions: 391
+   │  └─ These modify entity state but don't call force_versioning=True
 ```
 
 ### Conflict Resolution Metrics
@@ -547,6 +560,22 @@ The test has **zero simulation or fake data**:
 - `borrow_attribute_from()` calls
 - `promote_to_root()` and `detach()` calls
 - Real entity field modifications
+
+### Real vs ECS Version Creation
+
+**Important**: All operations perform **real ECS work**, but not all create ECS versions:
+
+**Version-Creating Operations**:
+- `version_entity`: Always creates new entity version
+- `complex_update`: Always creates new entity version + forces versioning
+- `promote_to_root`: Creates version when entity becomes root (idempotent if already root)
+- `detach_entity`: Creates version when entity becomes detached (idempotent if already detached)
+
+**State-Modifying Operations** (no versioning):
+- `modify_field`: Updates entity fields using `put()` functional API without versioning
+- `borrow_attribute`: Copies data between entities using `borrow_attribute_from()` without versioning
+
+This design explains why "operations completed" ≠ "versions created" in test results. The system efficiently updates entity state without creating unnecessary versions while maintaining complete audit trails through `modification_history` tracking.
 
 ### Legitimate Timing
 

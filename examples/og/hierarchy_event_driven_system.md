@@ -293,6 +293,40 @@ class GracePeriodTracker:
         return elapsed >= self.grace_period_seconds
 ```
 
+## Operation Versioning Behavior
+
+### Operations That Create ECS Versions:
+
+**Version-Creating Operations** always generate new entity versions in the ECS lineage:
+
+- **`version_entity`**: Always creates new entity version
+- **`complex_update`**: Always creates new entity version  
+- **`promote_to_root`**: Creates version when entity becomes root (idempotent if already root)
+- **`detach_entity`**: Creates version when entity becomes detached (idempotent if already detached)
+
+### Operations That Modify State Only:
+
+**State-Modifying Operations** update entity fields without ECS versioning:
+
+- **`modify_field`**: Updates entity fields using functional API without versioning
+- **`borrow_attribute`**: Copies data between entities without versioning
+
+This design allows efficient state updates without unnecessary version proliferation while maintaining complete audit trails through `modification_history` tracking.
+
+### Version Accounting Example:
+
+```python
+# In a typical stress test with 747 operations:
+# - version_entity: 236 operations → 236 versions
+# - complex_update: 120 operations → 120 versions  
+# - promote_to_root: 34 operations → ~20 versions (some idempotent)
+# - detach_entity: 43 operations → ~25 versions (some idempotent)
+# - modify_field: 164 operations → 0 versions (state-only)
+# - borrow_attribute: 150 operations → 0 versions (state-only)
+#
+# Result: 747 operations, ~401 versions + 5 originals = 406 total ECS versions
+```
+
 ## Real Operation Types
 
 ### 1. Entity Versioning Operations

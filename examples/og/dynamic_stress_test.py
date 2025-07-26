@@ -364,7 +364,7 @@ class RealOperationEntity(OperationEntity):
                 print(f"✅ SUCCESS: {self.operation_type} completed on target {str(target_entity.ecs_id)[:8]}")
             else:
                 print(f"❌ FAILED: {self.operation_type} failed on target {str(target_entity.ecs_id)[:8]}")
-                
+            
             return success
             
         except Exception as e:
