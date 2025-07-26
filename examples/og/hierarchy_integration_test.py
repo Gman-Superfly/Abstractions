@@ -1,5 +1,5 @@
 """
-REAL Hierarchy Integration Test - Validates All Failure and Win Modes
+Comprehensive Hierarchy Integration Test - Validates All Failure and Success Scenarios
 
 This is a comprehensive production test that validates:
 - Conflict resolution correctness under stress
@@ -7,15 +7,15 @@ This is a comprehensive production test that validates:
 - Operation lifecycle edge cases
 - Error handling and retry logic
 - Concurrent operation scenarios
-- All win/lose conditions
+- All failure and success conditions
 
-NO happy path demonstrations - only REAL validation with assertions.
+Production-grade validation with comprehensive assertions and edge case coverage.
 """
 
 import asyncio
 import time
 import random
-from uuid import uuid4, UUID
+from uuid import UUID
 from datetime import datetime, timezone
 from typing import List, Dict, Set, Optional
 
@@ -79,14 +79,14 @@ class GracePeriodTracker:
 
 
 class RealOperationEntity(OperationEntity):
-    """Operation that performs real work and can fail."""
+    """Production operation entity that performs actual work and handles failures."""
     
     operation_type: str = "test_operation"
     should_fail: bool = False
     execution_time_ms: float = 10.0
     
     async def execute_real_operation(self) -> bool:
-        """Execute real operation with configurable failure."""
+        """Execute operation with configurable failure scenarios."""
         await asyncio.sleep(self.execution_time_ms / 1000.0)  # Simulate work
         
         if self.should_fail:
@@ -115,14 +115,14 @@ class RealOperationEntity(OperationEntity):
 
 
 class HierarchyTestSuite:
-    """Comprehensive test suite for hierarchy system."""
+    """Comprehensive test suite for production hierarchy system validation."""
     
     def __init__(self):
         self.grace_tracker = GracePeriodTracker(0.1)  # 100ms grace period
         self.test_results = []
         
     def assert_condition(self, condition: bool, message: str, test_name: str):
-        """Assert a condition and track test results."""
+        """Assert a condition and track test results for production validation."""
         if condition:
             print(f"✅ {test_name}: {message}")
             self.test_results.append((test_name, True, message))
@@ -132,7 +132,7 @@ class HierarchyTestSuite:
             raise AssertionError(f"{test_name} failed: {message}")
     
     async def test_basic_conflict_resolution(self):
-        """TEST: Basic priority-based conflict resolution."""
+        """TEST: Comprehensive priority-based conflict resolution validation."""
         test_name = "BASIC_CONFLICT_RESOLUTION"
         
         # Create target entity
@@ -188,14 +188,14 @@ class HierarchyTestSuite:
         return target, ops
     
     async def test_executing_operation_protection(self):
-        """TEST: EXECUTING operations cannot be preempted."""
+        """TEST: Comprehensive validation that EXECUTING operations cannot be preempted."""
         test_name = "EXECUTING_PROTECTION"
         
         # Create target entity
         target = TestEntity(name="protection_test", value=0)
         target.promote_to_root()
         
-        # Create low priority operation and start executing it
+        # Create operation that performs actual work and can fail
         low_priority_op = RealOperationEntity(
             op_type="executing_op",
             operation_type="test_operation",
@@ -265,7 +265,7 @@ class HierarchyTestSuite:
         return target, low_priority_op, high_priority_op
     
     async def test_grace_period_protection(self):
-        """TEST: Operations within grace period cannot be preempted."""
+        """TEST: Comprehensive validation of grace period protection mechanisms."""
         test_name = "GRACE_PERIOD_PROTECTION"
         
         # Create target entity
@@ -327,7 +327,7 @@ class HierarchyTestSuite:
         return target, protected_op, attacking_op
     
     async def test_operation_failure_and_retry(self):
-        """TEST: Failed operations retry correctly."""
+        """TEST: Comprehensive validation of operation failure handling and retry logic."""
         test_name = "FAILURE_AND_RETRY"
         
         # Create target entity
@@ -345,7 +345,7 @@ class HierarchyTestSuite:
         )
         failing_op.promote_to_root()
         
-        # Execute and fail
+        # Execute and validate failure
         failing_op.start_execution()
         success = await failing_op.execute_real_operation()
         
@@ -409,14 +409,14 @@ class HierarchyTestSuite:
         return target, failing_op
     
     async def test_concurrent_stress_scenario(self):
-        """TEST: Many concurrent operations with realistic timing."""
+        """TEST: Comprehensive concurrent operations validation under stress conditions."""
         test_name = "CONCURRENT_STRESS"
         
         # Create target entity
         target = TestEntity(name="stress_test", value=0)
         target.promote_to_root()
         
-        # Create many operations with random priorities
+        # Create many operations with random priorities for stress testing
         num_operations = 50
         operations = []
         
@@ -493,7 +493,7 @@ class HierarchyTestSuite:
         return target, operations, winners
     
     async def test_hierarchy_inheritance(self):
-        """TEST: Child operations inherit parent priority correctly."""
+        """TEST: Comprehensive validation of hierarchical priority inheritance."""
         test_name = "HIERARCHY_INHERITANCE"
         
         # Create target entity
@@ -561,9 +561,9 @@ class HierarchyTestSuite:
         return target, parent_op, child_op, competitor_op
     
     def print_test_summary(self):
-        """Print comprehensive test results."""
+        """Print comprehensive production test results."""
         print("\n" + "=" * 80)
-        print("🧪 HIERARCHY INTEGRATION TEST RESULTS")
+        print("🧪 COMPREHENSIVE HIERARCHY INTEGRATION TEST RESULTS")
         print("=" * 80)
         
         passed = len([r for r in self.test_results if r[1]])
@@ -572,9 +572,9 @@ class HierarchyTestSuite:
         print(f"📊 Tests: {passed}/{total} passed")
         
         if passed == total:
-            print("🎉 ALL TESTS PASSED - Hierarchy system is production ready!")
+            print("🎉 ALL TESTS PASSED - Hierarchy system validated for production use")
         else:
-            print("❌ SOME TESTS FAILED - System needs fixes!")
+            print("❌ SOME TESTS FAILED - System requires fixes before production deployment")
         
         print("\n📋 Detailed Results:")
         for test_name, success, message in self.test_results:
@@ -583,9 +583,9 @@ class HierarchyTestSuite:
 
 
 async def main():
-    """Run comprehensive hierarchy integration tests."""
-    print("🚀 REAL Hierarchy Integration Test Suite")
-    print("Testing ALL failure and win modes with REAL validation")
+    """Execute comprehensive hierarchy integration test suite."""
+    print("🚀 Comprehensive Hierarchy Integration Test Suite")
+    print("Production-grade validation of all failure and success scenarios")
     print("=" * 80)
     
     # Start the event bus
@@ -599,7 +599,7 @@ async def main():
         # Create test suite
         test_suite = HierarchyTestSuite()
         
-        # Run all tests
+        # Execute comprehensive test suite
         await test_suite.test_basic_conflict_resolution()
         await test_suite.test_executing_operation_protection()
         await test_suite.test_grace_period_protection()
@@ -607,7 +607,7 @@ async def main():
         await test_suite.test_concurrent_stress_scenario()
         await test_suite.test_hierarchy_inheritance()
         
-        # Print results
+        # Print comprehensive results
         test_suite.print_test_summary()
         
     except Exception as e:
