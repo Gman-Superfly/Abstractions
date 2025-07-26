@@ -635,7 +635,7 @@ class ConflictResolutionTest:
                             self.metrics.record_grace_period_save()
                 
                 # ACTUALLY CALL THE CONFLICT RESOLUTION SYSTEM
-                winners = resolve_operation_conflicts(target_entity_id, conflicts)
+                winners = resolve_operation_conflicts(target_entity_id, conflicts, self.grace_tracker)
                 
                 print(f"🏆 RESOLUTION: {len(winners)} winner(s), {len(conflicts) - len(winners)} rejected")
                 
@@ -1184,7 +1184,7 @@ async def main():
         },
         target_completion_rate=0.20,  # Low expectation due to brutal conflicts
         max_memory_mb=1000,
-        grace_period_seconds=0.2  # Small grace period to allow some protection
+        grace_period_seconds=0.05  # Increased to 50ms to catch some operations in grace period
     )
     
     print("🚀 CONFLICT RESOLUTION ALGORITHM TEST")

@@ -405,12 +405,13 @@ def create_operation_hierarchy(operations: List[OperationEntity], parent_op: Opt
     return operations
 
 
-def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List[OperationEntity]) -> List[OperationEntity]:
+def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List[OperationEntity], grace_tracker=None) -> List[OperationEntity]:
     """
     Resolve conflicts between operations targeting the same entity.
     
     EXECUTING operations are protected from preemption - they cannot be rejected
-    once they have started execution. Only PENDING operations can be preempted.
+    once they have started execution. Operations within their grace period are
+    also protected from preemption.
     """
     assert len(current_operations) > 0, "Cannot resolve conflicts for empty operation list"
     
@@ -421,7 +422,17 @@ def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List
     # EXECUTING operations are automatically winners - they cannot be preempted
     winning_ops = executing_ops.copy()
     
-    # Only resolve conflicts among PENDING operations
+    # Check for grace period protection among pending operations
+    grace_protected_ops = []
+    if grace_tracker:
+        protected_ids = grace_tracker.get_protected_operations()
+        grace_protected_ops = [op for op in pending_ops if op.ecs_id in protected_ids]
+        # Grace protected operations are also winners
+        winning_ops.extend(grace_protected_ops)
+        # Remove grace protected operations from pending competition
+        pending_ops = [op for op in pending_ops if op.ecs_id not in protected_ids]
+    
+    # Only resolve conflicts among non-protected PENDING operations
     if pending_ops:
         priority_groups: Dict[int, List[OperationEntity]] = {}
         
@@ -443,7 +454,7 @@ def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List
         # Add winning pending operation to winners
         winning_ops.extend(highest_priority_pending)
         
-        # Reject losing pending operations (cannot preempt executing operations)
+        # Reject losing pending operations (cannot preempt executing or grace-protected operations)
         losing_pending_ops = [op for ops in priority_groups.values() for op in ops if op not in highest_priority_pending]
         
         for op in losing_pending_ops:
@@ -451,6 +462,8 @@ def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List
             op.completed_at = datetime.now(timezone.utc)
             if executing_ops:
                 op.error_message = f"Cannot preempt executing operation(s). Protected operations: {[str(eo.ecs_id)[:8] for eo in executing_ops]}"
+            elif grace_protected_ops:
+                op.error_message = f"Cannot preempt grace-protected operation(s). Protected operations: {[str(gp.ecs_id)[:8] for gp in grace_protected_ops]}"
             elif highest_priority_pending:
                 op.error_message = f"Preempted by higher priority pending operation {highest_priority_pending[0].ecs_id}"
             op.update_ecs_ids()
