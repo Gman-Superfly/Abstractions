@@ -1131,39 +1131,20 @@ class ConflictResolutionTest:
                 print(f"   │    ├─ ✅ Entity was modified! ({len(root_versions)} versions in lineage)")
                 
                 # Show version IDs from lineage
-                for j, root_ecs_id in enumerate(root_versions[-3:]):  # Show last 3 versions
+                versions_to_show = min(3, len(root_versions))
+                for j, root_ecs_id in enumerate(root_versions[:versions_to_show]):
                     print(f"   │    │  Version {j}: root_ecs_id={str(root_ecs_id)[:8]}")
+                
+                # Show truncation message if there are more versions
+                if len(root_versions) > 3:
+                    remaining = len(root_versions) - 3
+                    print(f"   │    │  --------{remaining} more cut out for sanity-----")
+                
+                # ECS lineage is the authoritative source of modification count
+                actual_modifications = len(root_versions) - 1  # versions - 1 = modifications
+                print(f"   │    └─ ✅ Confirmed modifications: {actual_modifications} (from ECS lineage + 1 Original)")
             else:
-                print(f"   │    ├─ ❌ No versions beyond original (lineage has {len(root_versions)} entries)")
-            
-            # Check current in-memory entity state (original instance)
-            print(f"   │    ├─ Original entity state: counter={target.counter}, data_value={target.data_value:.1f}")
-            print(f"   │    ├─ Original modification history: {len(target.modification_history)} entries")
-            
-            # Check latest version from ECS tree registry
-            if root_versions:
-                latest_root_id = root_versions[-1]
-                latest_tree = EntityRegistry.tree_registry.get(latest_root_id)
-                if latest_tree:
-                    # Find the latest version of this entity in the tree
-                    latest_entity = None
-                    for entity_id, entity in latest_tree.nodes.items():
-                        if (isinstance(entity, TestDataEntity) and 
-                            entity.lineage_id == target.lineage_id):
-                            latest_entity = entity
-                            break
-                    
-                    if latest_entity:
-                        print(f"   │    ├─ Latest version state: counter={latest_entity.counter}, data_value={latest_entity.data_value:.1f}")
-                        print(f"   │    └─ Latest modification history: {len(latest_entity.modification_history)} entries")
-                        if latest_entity.modification_history and len(latest_entity.modification_history) > 1:
-                            print(f"   │      Recent: {latest_entity.modification_history[-1][:60]}...")
-                    else:
-                        print(f"   │    └─ ❌ Latest version entity not found in tree")
-                else:
-                    print(f"   │    └─ ❌ Latest tree not found in registry")
-            else:
-                print(f"   │    └─ Original modification history: {len(target.modification_history)} entries")
+                print(f"   │    └─ ❌ No versions beyond original (lineage has {len(root_versions)} entries)")
         
         print(f"   ├─ Entities with ECS versions: {modifications_detected}/{len(self.target_entities)}")
         print(f"   ├─ Total ECS versions found: {total_versions_found}")
@@ -1319,7 +1300,7 @@ async def main():
             OperationPriority.HIGH: 0.25,
             OperationPriority.CRITICAL: 0.25
         },
-        target_completion_rate=0.20,  # Low expectation due to brutal conflicts
+        target_completion_rate=0.10,  # Very low expectation due to brutal conflicts at 100 ops/sec
         max_memory_mb=1000,
         grace_period_seconds=0.05  # Increased to 50ms to catch some operations in grace period
     )
