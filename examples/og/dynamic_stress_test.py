@@ -438,6 +438,11 @@ class ConflictResolutionTest:
         print(f"   ├─ Grace period: {self.config.grace_period_seconds:.1f}s")
         print(f"   └─ Target completion rate: {self.config.target_completion_rate:.1%}")
         
+        # Set up event handlers for pure event-driven approach
+        from abstractions.events.events import setup_operation_event_handlers
+        setup_operation_event_handlers()
+        print("✅ Event handlers registered for pure event-driven conflict resolution")
+        
         # Create target entities that can be modified
         for i in range(self.config.num_targets):
             target = TestDataEntity(
@@ -642,31 +647,41 @@ class ConflictResolutionTest:
                         for _ in range(executing_protected_count):
                             self.metrics.record_grace_period_save()
                 
-                # PRODUCTION CONFLICT RESOLUTION SYSTEM
-                winners = resolve_operation_conflicts(target_entity_id, conflicts, self.grace_tracker)
+                # PURE EVENT-DRIVEN CONFLICT RESOLUTION
+                await emit(OperationConflictEvent(
+                    process_name="conflict_resolution_test",
+                    op_id=conflicts[0].ecs_id,  # Primary conflicting operation
+                    op_type=conflicts[0].op_type,
+                    target_entity_id=target_entity_id,
+                    priority=conflicts[0].priority,
+                    conflict_details={
+                        "total_conflicts": len(conflicts),
+                        "conflict_priorities": [op.priority for op in conflicts],
+                        "conflict_operation_types": [getattr(op, 'operation_type', 'unknown') for op in conflicts if hasattr(op, 'operation_type')]
+                    },
+                    conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
+                ))
                 
-                print(f"🏆 RESOLUTION: {len(winners)} winner(s), {len(conflicts) - len(winners)} rejected")
+                # Give event handlers time to process
+                await asyncio.sleep(0.01)  # Small delay for event processing
+                
+                # Check results after event-driven resolution
+                resolved_conflicts = get_conflicting_operations(target_entity_id)
+                rejected_count = len([op for op in conflicts if op.status == OperationStatus.REJECTED])
+                winners_count = len(conflicts) - rejected_count
+                
+                print(f"🏆 EVENT-DRIVEN RESOLUTION: {winners_count} winner(s), {rejected_count} rejected")
                 
                 # Track what happened to the losing operations
-                losers = [op for op in conflicts if op not in winners]
-                for loser in losers:
-                    if loser.status == OperationStatus.REJECTED:
-                        print(f"❌ REJECTED: {loser.op_type} (ID: {str(loser.ecs_id)[:8]}) - Priority: {loser.priority}")
-                        self.metrics.record_operation_rejected(loser.priority)
+                for op in conflicts:
+                    if op.status == OperationStatus.REJECTED:
+                        print(f"❌ REJECTED: {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Priority: {op.priority}")
+                        self.metrics.record_operation_rejected(op.priority)
                         # Remove rejected operations from our tracking
-                        self.submitted_operations.discard(loser.ecs_id)
-                        self.grace_tracker.end_grace_period(loser.ecs_id)
+                        self.submitted_operations.discard(op.ecs_id)
+                        self.grace_tracker.end_grace_period(op.ecs_id)
                         
-                        # Emit rejection event
-                        await emit(OperationRejectedEvent(
-                            op_id=loser.ecs_id,
-                            op_type=loser.op_type,
-                            target_entity_id=loser.target_entity_id,
-                            from_state="pending",
-                            to_state="rejected",
-                            rejection_reason="preempted_by_higher_priority",
-                            retry_count=loser.retry_count
-                        ))
+                        # Event handlers already emit rejection events, so we don't need to emit again
                 
                 resolution_time = (time.time() - start_time) * 1000
                 self.metrics.record_conflict_resolved(resolution_time)

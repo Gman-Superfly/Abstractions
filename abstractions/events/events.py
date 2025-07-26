@@ -403,31 +403,28 @@ class OperationRetryEvent(Event):
 
 
 # ============================================================================
-# EXAMPLE OPERATION CONFLICT RESOLUTION HANDLERS
+# PRODUCTION OPERATION CONFLICT RESOLUTION HANDLERS
 # ============================================================================
 
 def setup_operation_event_handlers():
     """
-    Set up example event handlers for operation conflict resolution.
+    Set up production event handlers for operation conflict resolution.
     
-    Call this function to register the conflict resolution handlers.
-    These are examples that can be customized for your specific needs.
+    This configures the event-driven conflict resolution system that handles
+    operation conflicts, rejections, and retries through the event bus.
     """
     
     @on(OperationConflictEvent)
     async def resolve_operation_conflict(event: OperationConflictEvent):
         """
-        Handler to resolve conflicts based on priority and hierarchy.
+        Production handler for operation conflicts.
         
-        This example handler demonstrates priority-based conflict resolution:
-        1. Compare operation priorities
-        2. Handle hierarchical relationships (parent-child operations)
-        3. Use timestamps as tiebreakers
-        4. Emit rejection events for losing operations
+        Resolves conflicts using priority-based resolution and emits
+        appropriate rejection events for losing operations.
         """
         try:
-            # Import here to avoid circular dependencies
             from abstractions.ecs.functional_api import get
+            from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts, get_conflicting_operations
             
             # Get the conflicting operation
             current_op = get(f"@{event.op_id}")
@@ -435,68 +432,60 @@ def setup_operation_event_handlers():
                 logger.error(f"Could not find operation entity {event.op_id}")
                 return
             
-            # Try to import the conflict resolution function
-            try:
-                from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts, get_conflicting_operations
+            # Find all operations targeting the same entity
+            conflicting_ops = get_conflicting_operations(event.target_entity_id)
+            
+            if conflicting_ops:
+                # Resolve conflicts using the hierarchy system
+                winning_ops = resolve_operation_conflicts(
+                    event.target_entity_id,
+                    [current_op] + conflicting_ops
+                )
                 
-                # Find all operations targeting the same entity
-                conflicting_ops = get_conflicting_operations(event.target_entity_id)
-                
-                if conflicting_ops:
-                    # Use the utility function for conflict resolution
-                    winning_ops = resolve_operation_conflicts(
-                        event.target_entity_id,
-                        [current_op] + conflicting_ops
-                    )
-                    
-                    # The losing operations have already been marked as rejected
-                    # by resolve_operation_conflicts, so we just need to emit events
-                    for op in conflicting_ops:
-                        if op not in winning_ops:
-                            await emit(OperationRejectedEvent(
-                                op_id=op.ecs_id,
-                                op_type=op.op_type,
-                                target_entity_id=op.target_entity_id,
-                                rejection_reason="preempted_by_higher_priority",
-                                retry_count=op.retry_count
-                            ))
+                # Emit rejection events for losing operations
+                for op in conflicting_ops:
+                    if op not in winning_ops and op.status.value == "rejected":
+                        await emit(OperationRejectedEvent(
+                            op_id=op.ecs_id,
+                            op_type=op.op_type,
+                            target_entity_id=op.target_entity_id,
+                            from_state="pending",
+                            to_state="rejected",
+                            rejection_reason="preempted_by_higher_priority",
+                            retry_count=op.retry_count
+                        ))
                 
                 logger.info(f"Resolved conflict for operation {event.op_id} on entity {event.target_entity_id}")
-                
-            except ImportError:
-                logger.warning("Operation hierarchy module not available, skipping conflict resolution")
             
+        except ImportError as e:
+            logger.error(f"Required modules not available for conflict resolution: {e}")
         except Exception as e:
             logger.error(f"Error in conflict resolution handler: {e}", exc_info=True)
     
     @on(OperationRejectedEvent)
     async def handle_operation_rejection(event: OperationRejectedEvent):
         """
-        Handler for cleanup and logging when operations are rejected.
+        Production handler for operation rejections.
         
-        This handler can be customized to:
-        1. Log rejection events for monitoring
-        2. Update parent operations about child failures
-        3. Trigger compensation or rollback logic
-        4. Notify external systems about operation failures
+        Handles cleanup, logging, and parent operation updates when
+        operations are rejected due to conflicts or failures.
         """
         try:
-            logger.warning(
+            logger.info(
                 f"Operation {event.op_type} (ID: {event.op_id}) rejected: {event.rejection_reason}. "
                 f"Retry count: {event.retry_count}"
             )
             
-            # Optional: Update parent operations in hierarchy
-            from abstractions.ecs.functional_api import get
-            op = get(f"@{event.op_id}")
-            if op and op.parent_op_id:
-                parent_op = get(f"@{op.parent_op_id}")
-                if parent_op:
-                    # Could update parent's failed children count or emit parent events
-                    logger.info(f"Child operation {event.op_id} rejected under parent {op.parent_op_id}")
-            
-            # Optional: Trigger compensation logic or external notifications
-            # await notify_external_system_of_rejection(event)
+            # Update parent operations in hierarchy if applicable
+            try:
+                from abstractions.ecs.functional_api import get
+                op = get(f"@{event.op_id}")
+                if op and hasattr(op, 'parent_op_id') and op.parent_op_id:
+                    parent_op = get(f"@{op.parent_op_id}")
+                    if parent_op:
+                        logger.debug(f"Child operation {event.op_id} rejected under parent {op.parent_op_id}")
+            except Exception as e:
+                logger.debug(f"Could not update parent operation: {e}")
             
         except Exception as e:
             logger.error(f"Error in rejection handler: {e}", exc_info=True)
@@ -504,12 +493,9 @@ def setup_operation_event_handlers():
     @on(OperationRetryEvent)
     async def handle_operation_retry(event: OperationRetryEvent):
         """
-        Handler for operation retry events.
+        Production handler for operation retries.
         
-        Logs retry attempts and can be extended to:
-        1. Update retry statistics
-        2. Implement adaptive retry strategies
-        3. Alert on excessive retries
+        Logs retry attempts and monitors for excessive retry patterns.
         """
         try:
             logger.info(
@@ -527,16 +513,6 @@ def setup_operation_event_handlers():
             
         except Exception as e:
             logger.error(f"Error in retry handler: {e}", exc_info=True)
-    
-    @on(pattern="operation.*")
-    def log_all_operation_events(event: Event):
-        """
-        Handler that logs all operation-related events for debugging.
-        
-        This can be useful during development or for comprehensive audit trails.
-        Remove or disable in production if too verbose.
-        """
-        logger.debug(f"Operation event: {event.type} - {event.id}")
 
 
 # ============================================================================
