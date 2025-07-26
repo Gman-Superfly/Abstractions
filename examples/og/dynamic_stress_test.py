@@ -329,28 +329,65 @@ class ConflictResolutionTest:
             except Exception as e:
                 print(f"⚠️  Error in conflict monitoring: {e}")
                 
-    async def operation_lifecycle_observer(self):
-        """Observe operation lifecycle and record metrics."""
+    async def operation_lifecycle_driver(self):
+        """Drive operation lifecycle - start and complete operations."""
         while not self.stop_flag:
             try:
-                # Check for started operations
+                # Find pending operations and start some of them
+                started_count = 0
                 for op_id in list(self.submitted_operations):
+                    if started_count >= 5:  # Limit concurrent starts per cycle
+                        break
+                        
                     for root_id in EntityRegistry.tree_registry.keys():
                         tree = EntityRegistry.tree_registry.get(root_id)
                         if tree and op_id in tree.nodes:
                             op = tree.nodes[op_id]
                             if isinstance(op, OperationEntity):
                                 
-                                if op.status == OperationStatus.EXECUTING:
-                                    if op_id not in self.grace_tracker.executing_operations:
+                                # Start pending operations
+                                if op.status == OperationStatus.PENDING:
+                                    try:
+                                        op.start_execution()
                                         self.grace_tracker.start_grace_period(op.ecs_id)
                                         self.metrics.record_operation_started(op.priority)
+                                        started_count += 1
+                                        
+                                        await emit(OperationStartedEvent(
+                                            process_name="conflict_resolution_test",
+                                            op_id=op.ecs_id,
+                                            op_type=op.op_type,
+                                            priority=op.priority,
+                                            target_entity_id=op.target_entity_id
+                                        ))
+                                    except Exception as e:
+                                        # Operation couldn't start (maybe rejected by conflict resolution)
+                                        pass
                                 
-                                elif op.status == OperationStatus.SUCCEEDED:
-                                    self.grace_tracker.end_grace_period(op.ecs_id)
-                                    self.submitted_operations.discard(op_id)
-                                    self.metrics.record_operation_completed(op.priority)
+                                # Complete executing operations after a brief execution time
+                                elif op.status == OperationStatus.EXECUTING:
+                                    execution_time = (datetime.now(timezone.utc) - op.started_at).total_seconds() if op.started_at else 0
+                                    
+                                    # Complete after 0.1-0.5 seconds of execution
+                                    if execution_time > 0.1:
+                                        try:
+                                            op.complete_operation(success=True)
+                                            self.grace_tracker.end_grace_period(op.ecs_id)
+                                            self.submitted_operations.discard(op_id)
+                                            self.metrics.record_operation_completed(op.priority)
+                                            
+                                            await emit(OperationCompletedEvent(
+                                                process_name="conflict_resolution_test",
+                                                op_id=op.ecs_id,
+                                                op_type=op.op_type,
+                                                target_entity_id=op.target_entity_id,
+                                                execution_duration_ms=execution_time * 1000
+                                            ))
+                                        except Exception as e:
+                                            # Operation failed to complete
+                                            pass
                                 
+                                # Clean up rejected operations
                                 elif op.status == OperationStatus.REJECTED:
                                     self.grace_tracker.end_grace_period(op.ecs_id)
                                     self.submitted_operations.discard(op_id)
@@ -358,6 +395,26 @@ class ConflictResolutionTest:
                             break
                             
                 await asyncio.sleep(0.05)  # Check every 50ms
+                
+            except Exception as e:
+                print(f"⚠️  Error in lifecycle driver: {e}")
+                
+    async def operation_lifecycle_observer(self):
+        """Observe operation lifecycle for additional metrics."""
+        while not self.stop_flag:
+            try:
+                # Just observe for additional metrics/validation
+                for op_id in list(self.submitted_operations):
+                    for root_id in EntityRegistry.tree_registry.keys():
+                        tree = EntityRegistry.tree_registry.get(root_id)
+                        if tree and op_id in tree.nodes:
+                            op = tree.nodes[op_id]
+                            if isinstance(op, OperationEntity):
+                                # Additional validation could go here
+                                pass
+                            break
+                            
+                await asyncio.sleep(0.1)  # Check every 100ms
                 
             except Exception as e:
                 print(f"⚠️  Error in lifecycle observer: {e}")
@@ -407,6 +464,7 @@ class ConflictResolutionTest:
         tasks = [
             asyncio.create_task(self.operation_submission_worker()),
             asyncio.create_task(self.conflict_monitoring_worker()),
+            asyncio.create_task(self.operation_lifecycle_driver()),
             asyncio.create_task(self.operation_lifecycle_observer()),
             asyncio.create_task(self.metrics_collector()),
             asyncio.create_task(self.progress_reporter())
