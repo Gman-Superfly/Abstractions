@@ -21,11 +21,11 @@ from uuid import UUID
 from abstractions.ecs.entity_hierarchy import (
     OperationEntity, StructuralOperation, NormalOperation, LowPriorityOperation,
     OperationStatus, OperationPriority,
-    get_conflicting_operations, get_operation_stats
+    get_conflicting_operations, get_operation_stats, resolve_operation_conflicts
 )
 from abstractions.events.events import (
     get_event_bus, emit,
-    OperationStartedEvent, OperationCompletedEvent, OperationRejectedEvent
+    OperationStartedEvent, OperationCompletedEvent, OperationRejectedEvent, OperationConflictEvent, OperationRetryEvent
 )
 from abstractions.ecs.entity import Entity, EntityRegistry
 
@@ -85,6 +85,9 @@ class ConflictResolutionMetrics:
         self.operations_started = 0
         self.operations_completed = 0
         self.operations_rejected = 0
+        self.operations_failed = 0
+        self.operations_retried = 0
+        self.operations_in_progress = 0
         self.conflicts_detected = 0
         self.conflicts_resolved = 0
         
@@ -93,6 +96,8 @@ class ConflictResolutionMetrics:
         self.started_by_priority = defaultdict(int)
         self.completed_by_priority = defaultdict(int)
         self.rejected_by_priority = defaultdict(int)
+        self.failed_by_priority = defaultdict(int)
+        self.retried_by_priority = defaultdict(int)
         
         # Grace period metrics
         self.grace_period_saves = 0
@@ -131,6 +136,19 @@ class ConflictResolutionMetrics:
         self.operations_rejected += 1
         priority_name = self._get_priority_name(priority)
         self.rejected_by_priority[priority_name] += 1
+        
+    def record_operation_failed(self, priority: OperationPriority):
+        self.operations_failed += 1
+        priority_name = self._get_priority_name(priority)
+        self.failed_by_priority[priority_name] += 1
+        
+    def record_operation_retried(self, priority: OperationPriority):
+        self.operations_retried += 1
+        priority_name = self._get_priority_name(priority)
+        self.retried_by_priority[priority_name] += 1
+        
+    def update_operations_in_progress(self, count: int):
+        self.operations_in_progress = count
         
     def record_conflict_detected(self, num_conflicts: int):
         self.conflicts_detected += 1
@@ -259,6 +277,16 @@ class ConflictResolutionTest:
         
         return operation
         
+    def _get_operation_status(self, op_id: UUID) -> Optional[OperationStatus]:
+        """Get the current status of an operation."""
+        for root_id in EntityRegistry.tree_registry.keys():
+            tree = EntityRegistry.tree_registry.get(root_id)
+            if tree and op_id in tree.nodes:
+                op = tree.nodes[op_id]
+                if isinstance(op, OperationEntity):
+                    return op.status
+        return None
+        
     async def detect_and_resolve_conflicts(self, target_entity_id: UUID):
         """Detect and resolve conflicts using the system's conflict resolution."""
         start_time = time.time()
@@ -269,15 +297,49 @@ class ConflictResolutionTest:
             if len(conflicts) > 1:
                 self.metrics.record_conflict_detected(len(conflicts))
                 
-                # Track protection stats
+                # Emit conflict detection event
+                await emit(OperationConflictEvent(
+                    process_name="conflict_resolution_test",
+                    op_id=conflicts[0].ecs_id,  # Primary conflicting operation
+                    op_type=conflicts[0].op_type,
+                    target_entity_id=target_entity_id,
+                    priority=conflicts[0].priority,
+                    conflict_details={
+                        "total_conflicts": len(conflicts),
+                        "conflict_priorities": [op.priority for op in conflicts]
+                    },
+                    conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
+                ))
+                
+                # Track protection stats BEFORE resolution
                 protected = self.grace_tracker.get_protected_operations()
                 protected_count = len([op for op in conflicts if op.ecs_id in protected])
                 
                 if protected_count > 0:
                     self.metrics.record_operation_protected()
                 
-                # Let the system's conflict resolution handle it
-                # We just observe what happens
+                # ACTUALLY CALL THE CONFLICT RESOLUTION SYSTEM
+                winners = resolve_operation_conflicts(target_entity_id, conflicts)
+                
+                # Track what happened to the losing operations
+                losers = [op for op in conflicts if op not in winners]
+                for loser in losers:
+                    if loser.status == OperationStatus.REJECTED:
+                        self.metrics.record_operation_rejected(loser.priority)
+                        # Remove rejected operations from our tracking
+                        self.submitted_operations.discard(loser.ecs_id)
+                        self.grace_tracker.end_grace_period(loser.ecs_id)
+                        
+                        # Emit rejection event
+                        await emit(OperationRejectedEvent(
+                            op_id=loser.ecs_id,
+                            op_type=loser.op_type,
+                            target_entity_id=loser.target_entity_id,
+                            from_state="pending",
+                            to_state="rejected",
+                            rejection_reason="preempted_by_higher_priority",
+                            retry_count=loser.retry_count
+                        ))
                 
                 resolution_time = (time.time() - start_time) * 1000
                 self.metrics.record_conflict_resolved(resolution_time)
@@ -291,18 +353,24 @@ class ConflictResolutionTest:
         
         while not self.stop_flag:
             try:
-                # Select priority based on distribution
+                # Select priority based on distribution using round-robin
                 priorities = list(self.config.priority_distribution.keys())
                 weights = list(self.config.priority_distribution.values())
                 
-                # Simple weighted selection without random.choices
-                cumulative = 0
-                rand_val = hash(str(time.time())) % 1000 / 1000.0  # Simple pseudo-random
+                # Use operation counter to select priority in a predictable pattern
+                # This ensures we get the exact distribution specified
+                cumulative_weights = []
+                running_total = 0
+                for weight in weights:
+                    running_total += weight
+                    cumulative_weights.append(running_total)
+                
+                # Normalize to operation counter
+                normalized_counter = (self.operation_counter % 1000) / 1000.0
                 
                 selected_priority = priorities[0]
-                for i, weight in enumerate(weights):
-                    cumulative += weight
-                    if rand_val <= cumulative:
+                for i, cumulative_weight in enumerate(cumulative_weights):
+                    if normalized_counter <= cumulative_weight:
                         selected_priority = priorities[i]
                         break
                 
@@ -362,15 +430,27 @@ class ConflictResolutionTest:
                                         ))
                                     except Exception as e:
                                         # Operation couldn't start (maybe rejected by conflict resolution)
-                                        pass
+                                        # Try to retry if it failed
+                                        if op.status == OperationStatus.FAILED:
+                                            if op.increment_retry():
+                                                self.metrics.record_operation_retried(op.priority)
+                                            else:
+                                                # Max retries exceeded - now rejected
+                                                self.submitted_operations.discard(op_id)
+                                                self.metrics.record_operation_rejected(op.priority)
                                 
-                                # Complete executing operations after a brief execution time
+                                # Complete executing operations when they've had time to execute
                                 elif op.status == OperationStatus.EXECUTING:
                                     execution_time = (datetime.now(timezone.utc) - op.started_at).total_seconds() if op.started_at else 0
                                     
-                                    # Complete after 0.1-0.5 seconds of execution
-                                    if execution_time > 0.1:
+                                    # Allow operations to complete after they've had some execution time
+                                    min_execution_time = 0.05  # Minimum 50ms execution time
+                                    if execution_time >= min_execution_time:
                                         try:
+                                            # Real operation execution - no artificial failures
+                                            # Let the system fail naturally through real ECS operations
+                                            
+                                            # Normal operation completion
                                             op.complete_operation(success=True)
                                             self.grace_tracker.end_grace_period(op.ecs_id)
                                             self.submitted_operations.discard(op_id)
@@ -383,17 +463,58 @@ class ConflictResolutionTest:
                                                 target_entity_id=op.target_entity_id,
                                                 execution_duration_ms=execution_time * 1000
                                             ))
+                                            
                                         except Exception as e:
-                                            # Operation failed to complete
-                                            pass
+                                            # REAL failure occurred during ECS operations - this should trigger retries!
+                                            op.complete_operation(success=False, error_message=str(e))
+                                            self.grace_tracker.end_grace_period(op.ecs_id)
+                                            
+                                            # Try to retry the failed operation using built-in retry system
+                                            if op.increment_retry():
+                                                self.metrics.record_operation_retried(op.priority)
+                                                
+                                                # Calculate backoff delay and emit retry event
+                                                backoff_delay = op.get_backoff_delay() * 1000  # Convert to ms
+                                                await emit(OperationRetryEvent(
+                                                    op_id=op.ecs_id,
+                                                    op_type=op.op_type,
+                                                    target_entity_id=op.target_entity_id,
+                                                    retry_count=op.retry_count,
+                                                    max_retries=op.max_retries,
+                                                    backoff_delay_ms=backoff_delay,
+                                                    retry_reason=str(e)
+                                                ))
+                                                # Operation goes back to PENDING for retry
+                                            else:
+                                                # Max retries exceeded - now rejected
+                                                self.submitted_operations.discard(op_id)
+                                                self.metrics.record_operation_rejected(op.priority)
                                 
                                 # Clean up rejected operations
                                 elif op.status == OperationStatus.REJECTED:
                                     self.grace_tracker.end_grace_period(op.ecs_id)
                                     self.submitted_operations.discard(op_id)
                                     self.metrics.record_operation_rejected(op.priority)
+                                
+                                # Handle failed operations - try to retry them
+                                elif op.status == OperationStatus.FAILED:
+                                    self.grace_tracker.end_grace_period(op.ecs_id)
+                                    
+                                    # Try to retry the failed operation
+                                    if op.increment_retry():
+                                        self.metrics.record_operation_retried(op.priority)
+                                        # Operation goes back to PENDING for retry
+                                    else:
+                                        # Max retries exceeded - now rejected
+                                        self.submitted_operations.discard(op_id)
+                                        self.metrics.record_operation_rejected(op.priority)
                             break
-                            
+                
+                # Update in-progress count
+                in_progress_count = len([op_id for op_id in self.submitted_operations 
+                                       if self._get_operation_status(op_id) == OperationStatus.EXECUTING])
+                self.metrics.update_operations_in_progress(in_progress_count)
+                
                 await asyncio.sleep(0.05)  # Check every 50ms
                 
             except Exception as e:
@@ -505,8 +626,27 @@ class ConflictResolutionTest:
         print(f"   ├─ Operations started: {self.metrics.operations_started}")
         print(f"   ├─ Operations completed: {self.metrics.operations_completed}")
         print(f"   ├─ Operations rejected: {self.metrics.operations_rejected}")
+        print(f"   ├─ Operations failed: {self.metrics.operations_failed}")
+        print(f"   ├─ Operations retried: {self.metrics.operations_retried}")
+        print(f"   ├─ Operations in progress: {self.metrics.operations_in_progress}")
         print(f"   ├─ Completion rate: {completion_rate:.1%}")
         print(f"   └─ Rejection rate: {rejection_rate:.1%}")
+        
+        # Operation accounting verification
+        total_accounted = (self.metrics.operations_completed + 
+                          self.metrics.operations_rejected + 
+                          self.metrics.operations_failed + 
+                          self.metrics.operations_in_progress)
+        unaccounted = self.metrics.operations_submitted - total_accounted
+        
+        print(f"\n📊 Operation Accounting:")
+        print(f"   ├─ Total submitted: {self.metrics.operations_submitted}")
+        print(f"   ├─ Total accounted: {total_accounted}")
+        print(f"   ├─ Unaccounted: {unaccounted}")
+        if unaccounted > 0:
+            print(f"   └─ ⚠️  {unaccounted} operations may be stuck in PENDING state")
+        else:
+            print(f"   └─ ✅ All operations accounted for")
         
         print(f"\n🛡️  Grace Period Results:")
         print(f"   ├─ Grace period saves: {self.metrics.grace_period_saves}")
@@ -581,13 +721,13 @@ async def main():
     # Example test configuration - all parameters explicit
     config = TestConfig(
         duration_seconds=120,  # 2 minutes
-        num_targets=4,
-        operation_rate_per_second=25.0,
+        num_targets=5,
+        operation_rate_per_second=10000.0,  # Increased mega stress test 10000 ops/sec
         priority_distribution={
             OperationPriority.LOW: 0.5,
-            OperationPriority.NORMAL: 0.3,
-            OperationPriority.HIGH: 0.15,
-            OperationPriority.CRITICAL: 0.05
+            OperationPriority.NORMAL: 0.2,
+            OperationPriority.HIGH: 0.2,
+            OperationPriority.CRITICAL: 0.1
         },
         target_completion_rate=0.02,  # 2% minimum completion rate expected
         max_memory_mb=200,
