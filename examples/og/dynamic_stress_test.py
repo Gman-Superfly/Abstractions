@@ -1,17 +1,17 @@
 """
-Conflict Resolution Algorithm Test
+Production Conflict Resolution Algorithm Test
 
-Production-ready test for validating conflict resolution algorithms.
-Submits REAL operations to the system and measures actual conflict resolution performance.
+Production-grade test for validating conflict resolution algorithms.
+Submits actual operations to the system and measures conflict resolution performance.
 
-This test uses REAL ECS operations that actually modify target entities:
+This test uses production ECS operations that perform actual entity modifications:
 - version_entity operations
 - borrow_attribute_from operations 
 - put() functional API operations
 - promote_to_root operations
 - detach operations
 
-NO fake data or simulated completions - all operations perform real work.
+Production validation with comprehensive measurements and edge case coverage.
 """
 
 import asyncio
@@ -285,7 +285,10 @@ class RealOperationEntity(OperationEntity):
             # Get target entity
             target_entity = self._get_target_entity()
             if not target_entity:
+                print(f"🚨 OPERATION FAILURE: Target entity {self.target_entity_id} not found for operation {self.op_type}")
                 raise ValueError(f"Target entity {self.target_entity_id} not found")
+            
+            print(f"🔧 EXECUTING: {self.operation_type} on target {str(target_entity.ecs_id)[:8]} (Operation: {self.op_type})")
             
             success = False
             
@@ -356,6 +359,11 @@ class RealOperationEntity(OperationEntity):
             else:
                 raise ValueError(f"Unknown operation type: {self.operation_type}")
             
+            if success:
+                print(f"✅ SUCCESS: {self.operation_type} completed on target {str(target_entity.ecs_id)[:8]}")
+            else:
+                print(f"❌ FAILED: {self.operation_type} failed on target {str(target_entity.ecs_id)[:8]}")
+                
             return success
             
         except Exception as e:
@@ -392,9 +400,9 @@ class RealOperationEntity(OperationEntity):
 
 class ConflictResolutionTest:
     """
-    Production-ready test for conflict resolution algorithms.
+    Production-grade test for conflict resolution algorithms.
     
-    Submits REAL operations to the system and measures actual performance.
+    Submits actual operations to the system and measures performance under stress.
     """
     
     def __init__(self, config: TestConfig):
@@ -402,7 +410,7 @@ class ConflictResolutionTest:
         self.metrics = ConflictResolutionMetrics()
         self.grace_tracker = GracePeriodTracker(config.grace_period_seconds)
         
-        # Test entities - using real entities that can be modified
+        # Test entities - using production entities that can be modified
         self.target_entities: List[TestDataEntity] = []
         self.source_entities: List[TestDataSource] = []
         self.submitted_operations: Set[UUID] = set()
@@ -411,7 +419,7 @@ class ConflictResolutionTest:
         # Operation ID counter for unique operation names
         self.operation_counter = 0
         
-        # Real operation types with weights
+        # Production operation types with weights
         self.real_operation_types = {
             "version_entity": 0.3,      # 30% versioning operations
             "modify_field": 0.25,       # 25% field modifications
@@ -422,8 +430,8 @@ class ConflictResolutionTest:
         }
         
     async def setup(self):
-        """Initialize test environment with REAL entities."""
-        print("🔧 Setting up conflict resolution test with REAL operations...")
+        """Initialize test environment with production entities."""
+        print("🔧 Setting up conflict resolution test with production operations...")
         print(f"   ├─ Test duration: {self.config.duration_seconds}s")
         print(f"   ├─ Target entities: {self.config.num_targets}")
         print(f"   ├─ Operation rate: {self.config.operation_rate_per_second:.1f} ops/sec")
@@ -455,11 +463,11 @@ class ConflictResolutionTest:
             source.promote_to_root()
             self.source_entities.append(source)
             
-        print(f"✅ Created {len(self.target_entities)} target entities with real data")
+        print(f"✅ Created {len(self.target_entities)} target entities with production data")
         print(f"✅ Created {len(self.source_entities)} source entities for borrowing operations")
         
     async def submit_operation(self, target: TestDataEntity, priority: OperationPriority) -> Optional[RealOperationEntity]:
-        """Submit a REAL operation to the system."""
+        """Submit a production operation to the system."""
         self.operation_counter += 1
         
         # Select real operation type based on weights
@@ -556,7 +564,7 @@ class ConflictResolutionTest:
         try:
             conflicts = get_conflicting_operations(target_entity_id)
             
-            # REAL-TIME VERIFICATION: Show ALL pending/executing operations for this target
+            # PRODUCTION VERIFICATION: Show all pending/executing operations for this target
             # But only during active submission phase to avoid spam during grace period
             all_operations_for_target = []
             for root_id in EntityRegistry.tree_registry.keys():
@@ -634,7 +642,7 @@ class ConflictResolutionTest:
                         for _ in range(executing_protected_count):
                             self.metrics.record_grace_period_save()
                 
-                # ACTUALLY CALL THE CONFLICT RESOLUTION SYSTEM
+                # PRODUCTION CONFLICT RESOLUTION SYSTEM
                 winners = resolve_operation_conflicts(target_entity_id, conflicts, self.grace_tracker)
                 
                 print(f"🏆 RESOLUTION: {len(winners)} winner(s), {len(conflicts) - len(winners)} rejected")
@@ -669,7 +677,7 @@ class ConflictResolutionTest:
             
     async def run_test(self):
         """Run the complete conflict resolution test with graceful shutdown."""
-        print(f"\n🚀 Starting Conflict Resolution Test with REAL Operations...")
+        print(f"\n🚀 Starting Conflict Resolution Test with Production Operations...")
         
         # Start all workers
         tasks = [
@@ -718,7 +726,7 @@ class ConflictResolutionTest:
             await asyncio.sleep(0.5)
             
     async def operation_submission_worker(self):
-        """Submit operations at the configured rate - BRUTAL CONFLICT MODE."""
+        """Submit operations at the configured rate - maximum stress mode."""
         interval = 1.0 / self.config.operation_rate_per_second
         
         # Track submission phase separately from overall test
@@ -793,7 +801,7 @@ class ConflictResolutionTest:
                 print(f"⚠️  Error in conflict monitoring: {e}")
                 
     async def operation_lifecycle_driver(self):
-        """Drive operation lifecycle - start and complete REAL operations."""
+        """Drive operation lifecycle - start and complete production operations."""
         while not self.stop_flag:
             try:
                 # MAXIMUM CONCURRENCY - no limits on concurrent operations
@@ -839,12 +847,12 @@ class ConflictResolutionTest:
                                     
                                     # Execute IMMEDIATELY - no artificial delays
                                     try:
-                                        # Execute the REAL operation
+                                        # Execute the production operation
                                         op_start_time = time.time()
                                         success = await op.execute_real_operation()
                                         op_duration_ms = (time.time() - op_start_time) * 1000
                                         
-                                        # Record real operation metrics
+                                        # Record production operation metrics
                                         self.metrics.record_real_operation(
                                             op.operation_type, 
                                             success, 
@@ -853,7 +861,7 @@ class ConflictResolutionTest:
                                         )
                                         
                                         if success:
-                                            # Real operation succeeded
+                                            # Production operation succeeded
                                             op.complete_operation(success=True)
                                             self.grace_tracker.end_grace_period(op.ecs_id)
                                             self.submitted_operations.discard(op_id)
@@ -867,11 +875,11 @@ class ConflictResolutionTest:
                                                 execution_duration_ms=execution_time * 1000
                                             ))
                                         else:
-                                            # Real operation failed
-                                            raise Exception(op.error_message or "Real operation failed")
+                                            # Production operation failed
+                                            raise Exception(op.error_message or "Production operation failed")
                                             
                                     except Exception as e:
-                                        # REAL failure occurred during ECS operations
+                                        # Production failure occurred during ECS operations
                                         op.complete_operation(success=False, error_message=str(e))
                                         self.grace_tracker.end_grace_period(op.ecs_id)
                                         
@@ -1038,8 +1046,8 @@ class ConflictResolutionTest:
         print(f"   ├─ Completion rate: {completion_rate:.1%}")
         print(f"   └─ Rejection rate: {rejection_rate:.1%}")
         
-        # Real operation metrics
-        print(f"\n🔧 REAL Operation Results:")
+        # Production operation metrics
+        print(f"\n🔧 PRODUCTION Operation Results:")
         print(f"   ├─ Total entity modifications: {self.metrics.entity_modifications}")
         print(f"   ├─ Versioning operations: {self.metrics.versioning_operations}")
         print(f"   ├─ Borrowing operations: {self.metrics.borrowing_operations}")
@@ -1047,9 +1055,9 @@ class ConflictResolutionTest:
         
         if self.metrics.real_operation_durations:
             avg_real_op_time = statistics.mean(self.metrics.real_operation_durations)
-            print(f"   ├─ Avg real operation time: {avg_real_op_time:.1f}ms")
+            print(f"   ├─ Avg production operation time: {avg_real_op_time:.1f}ms")
         
-        print(f"   └─ Real operations by type:")
+        print(f"   └─ Production operations by type:")
         for op_type, count in self.metrics.real_operations_by_type.items():
             success_count = self.metrics.real_operation_success_by_type.get(op_type, 0)
             success_rate = (success_count / count * 100) if count > 0 else 0
@@ -1103,15 +1111,144 @@ class ConflictResolutionTest:
             print(f"   ├─ Max memory: {max_memory:.1f} MB")
             print(f"   └─ Memory status: {'✅ Good' if max_memory < self.config.max_memory_mb else '⚠️ High'}")
         
-        # Data integrity validation
-        print(f"\n🔍 Data Integrity Validation:")
+        # ECS Lineage and Versioning Analysis
+        print(f"\n🔍 ECS Lineage and Versioning Analysis:")
         modifications_detected = 0
-        for target in self.target_entities:
-            if len(target.modification_history) > 1:  # More than just creation
-                modifications_detected += 1
+        total_versions_found = 0
         
-        print(f"   ├─ Entities with modifications: {modifications_detected}/{len(self.target_entities)}")
-        print(f"   ├─ Real operations verified: ✅ {self.metrics.entity_modifications > 0}")
+        for i, target in enumerate(self.target_entities):
+            target_id = target.ecs_id
+            print(f"   │  Target {i} (ID: {str(target_id)[:8]}):")
+            
+            # Check entity versioning through lineage registry (in-memory only)
+            lineage_id = target.lineage_id
+            root_versions = EntityRegistry.lineage_registry.get(lineage_id, [])
+            total_versions_found += len(root_versions)
+            print(f"   │    ├─ ECS Lineage versions: {len(root_versions)}")
+            
+            if len(root_versions) > 1:
+                modifications_detected += 1
+                print(f"   │    ├─ ✅ Entity was modified! ({len(root_versions)} versions in lineage)")
+                
+                # Show version IDs from lineage
+                for j, root_ecs_id in enumerate(root_versions[-3:]):  # Show last 3 versions
+                    print(f"   │    │  Version {j}: root_ecs_id={str(root_ecs_id)[:8]}")
+            else:
+                print(f"   │    ├─ ❌ No versions beyond original (lineage has {len(root_versions)} entries)")
+            
+            # Check current in-memory entity state (original instance)
+            print(f"   │    ├─ Original entity state: counter={target.counter}, data_value={target.data_value:.1f}")
+            print(f"   │    ├─ Original modification history: {len(target.modification_history)} entries")
+            
+            # Check latest version from ECS tree registry
+            if root_versions:
+                latest_root_id = root_versions[-1]
+                latest_tree = EntityRegistry.tree_registry.get(latest_root_id)
+                if latest_tree:
+                    # Find the latest version of this entity in the tree
+                    latest_entity = None
+                    for entity_id, entity in latest_tree.nodes.items():
+                        if (isinstance(entity, TestDataEntity) and 
+                            entity.lineage_id == target.lineage_id):
+                            latest_entity = entity
+                            break
+                    
+                    if latest_entity:
+                        print(f"   │    ├─ Latest version state: counter={latest_entity.counter}, data_value={latest_entity.data_value:.1f}")
+                        print(f"   │    └─ Latest modification history: {len(latest_entity.modification_history)} entries")
+                        if latest_entity.modification_history and len(latest_entity.modification_history) > 1:
+                            print(f"   │      Recent: {latest_entity.modification_history[-1][:60]}...")
+                    else:
+                        print(f"   │    └─ ❌ Latest version entity not found in tree")
+                else:
+                    print(f"   │    └─ ❌ Latest tree not found in registry")
+            else:
+                print(f"   │    └─ Original modification history: {len(target.modification_history)} entries")
+        
+        print(f"   ├─ Entities with ECS versions: {modifications_detected}/{len(self.target_entities)}")
+        print(f"   ├─ Total ECS versions found: {total_versions_found}")
+        print(f"   ├─ Total operations submitted: {self.metrics.operations_submitted}")
+        print(f"   ├─ Operations started: {self.metrics.operations_started}")
+        print(f"   ├─ Operations completed: {self.metrics.operations_completed}")
+        print(f"   ├─ Operations rejected: {self.metrics.operations_rejected}")
+        
+        # Cross-reference with operation metrics
+        expected_modifications = self.metrics.entity_modifications
+        print(f"   ├─ Expected modifications (from metrics): {expected_modifications}")
+        print(f"   ├─ Actual ECS versions found: {total_versions_found}")
+        
+        if total_versions_found > 0:
+            print(f"   ├─ ✅ ECS versioning verified: Entities were modified in ECS system")
+        else:
+            print(f"   ├─ ❌ No ECS versions found: Operations may not have reached entities")
+            
+        # Operation Lineage Analysis (in-memory)
+        print(f"\n🕵️ Operation Lineage Analysis:")
+        completed_operations = []
+        
+        # Find all completed operations in the in-memory ECS registry
+        all_operations_found = []
+        for root_id in EntityRegistry.tree_registry.keys():
+            tree = EntityRegistry.tree_registry.get(root_id)
+            if tree:
+                for entity_id, entity in tree.nodes.items():
+                    if isinstance(entity, RealOperationEntity):
+                        all_operations_found.append(entity)
+                        if entity.status == OperationStatus.SUCCEEDED:
+                            completed_operations.append(entity)
+        
+        print(f"   ├─ Total RealOperationEntity objects found: {len(all_operations_found)}")
+        print(f"   ├─ Operations with SUCCEEDED status: {len(completed_operations)}")
+        
+        # Show status breakdown of all operations found
+        if all_operations_found:
+            status_breakdown = {}
+            for op in all_operations_found:
+                status = op.status
+                status_breakdown[status] = status_breakdown.get(status, 0) + 1
+            
+            print(f"   ├─ Status breakdown of found operations:")
+            for status, count in status_breakdown.items():
+                print(f"   │    ├─ {status}: {count}")
+        
+        print(f"   ├─ Completed operations found in ECS: {len(completed_operations)}")
+        
+        # Group by target entity
+        ops_by_target = {}
+        for op in completed_operations:
+            target_id = op.target_entity_id
+            if target_id not in ops_by_target:
+                ops_by_target[target_id] = []
+            ops_by_target[target_id].append(op)
+        
+        print(f"   ├─ Targets that received operations: {len(ops_by_target)}")
+        
+        for target_id, ops in ops_by_target.items():
+            target_short_id = str(target_id)[:8]
+            print(f"   │  Target {target_short_id}: {len(ops)} completed operations")
+            
+            # Show operation types
+            op_types = {}
+            for op in ops:
+                op_type = getattr(op, 'operation_type', 'unknown')
+                op_types[op_type] = op_types.get(op_type, 0) + 1
+            
+            for op_type, count in op_types.items():
+                print(f"   │    ├─ {op_type}: {count}")
+        
+        # Final verification
+        total_ops_by_lineage = len(completed_operations)
+        total_ops_by_metrics = self.metrics.operations_completed
+        
+        print(f"   ├─ Operations by lineage tracking: {total_ops_by_lineage}")
+        print(f"   ├─ Operations by metrics tracking: {total_ops_by_metrics}")
+        
+        if total_ops_by_lineage == total_ops_by_metrics:
+            print(f"   ├─ ✅ Operation counts match perfectly")
+        else:
+            print(f"   ├─ ⚠️ Operation count mismatch: {abs(total_ops_by_lineage - total_ops_by_metrics)} difference")
+        
+        print(f"   ├─ Production operations verified: ✅ {self.metrics.entity_modifications > 0}")
         print(f"   └─ Conflict resolution verified: ✅ {self.metrics.conflicts_resolved > 0}")
         
         # Assessment
@@ -1125,12 +1262,12 @@ class ConflictResolutionTest:
             print("   ✅ GRACE PERIODS: Successfully protected executing operations")
         
         if self.metrics.conflicts_resolved > 0:
-            print("   ✅ CONFLICT RESOLUTION: System handled conflicts with real operations")
+            print("   ✅ CONFLICT RESOLUTION: System handled conflicts with production operations")
         
         if self.metrics.entity_modifications > 0:
-            print("   ✅ REAL OPERATIONS: System performed actual entity modifications")
+            print("   ✅ PRODUCTION OPERATIONS: System performed actual entity modifications")
         else:
-            print("   ❌ NO REAL WORK: No actual entity modifications detected")
+            print("   ❌ NO PRODUCTION WORK: No actual entity modifications detected")
         
         return {
             'completion_rate': completion_rate,
@@ -1156,7 +1293,7 @@ async def run_conflict_resolution_test(config: TestConfig) -> Dict[str, Any]:
         await test.run_test()
         results = await test.analyze_results()
         
-        print("\n🎉 Conflict resolution test with REAL operations completed!")
+        print("\n🎉 Conflict resolution test with production operations completed!")
         return results
         
     except Exception as e:
@@ -1190,22 +1327,22 @@ async def main():
     print("🚀 CONFLICT RESOLUTION ALGORITHM TEST")
     print("=" * 60)
     print("BRUTAL CONFLICT MODE - Multiple ops per target simultaneously")
-    print("Production test - submits REAL operations and measures results")
-    print("ALL operations perform actual ECS work - NO fake data!")
+    print("Production test - submits production operations and measures results")
+    print("ALL operations perform actual ECS work - comprehensive validation!")
     print("FORCING SIMULTANEOUS OPERATIONS ON SAME TARGETS")
     print("=" * 60)
     
     results = await run_conflict_resolution_test(config)
     
     if results.get('passed', False):
-        print(f"\n✅ TEST PASSED - System survived the brutal conflicts with REAL operations")
-        print(f"   ├─ Real modifications: {results.get('real_modifications', 0)}")
-        print(f"   ├─ Real operations: {results.get('real_operations', 0)}")
+        print(f"\n✅ TEST PASSED - System survived the brutal conflicts with production operations")
+        print(f"   ├─ Production modifications: {results.get('real_modifications', 0)}")
+        print(f"   ├─ Production operations: {results.get('real_operations', 0)}")
         print(f"   └─ Conflicts resolved: {results.get('conflicts_resolved', 0)}")
     else:
         print(f"\n❌ TEST FAILED - System could not handle the brutal conflicts")
         if results.get('real_modifications', 0) == 0:
-            print("   └─ ERROR: No real entity modifications detected!")
+            print("   └─ ERROR: No production entity modifications detected!")
         if results.get('conflicts_resolved', 0) == 0:
             print("   └─ WARNING: No conflicts detected - need more brutality!")
 
