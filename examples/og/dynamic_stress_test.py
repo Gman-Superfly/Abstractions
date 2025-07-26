@@ -1192,10 +1192,33 @@ class ConflictResolutionTest:
         print(f"   ├─ Expected modifications (from metrics): {expected_modifications}")
         print(f"   ├─ Actual ECS versions found: {total_versions_found}")
         
-        if total_versions_found > 0:
+        # Explain the version accounting
+        version_creating_ops = self.metrics.versioning_operations + self.metrics.real_operations_by_type.get('complex_update', 0)
+        original_entities = len(self.target_entities)
+        expected_versions = version_creating_ops + original_entities
+        
+        print(f"   ├─ Version accounting breakdown:")
+        print(f"   │  ├─ Operations that create versions: {version_creating_ops}")
+        print(f"   │  │  ├─ version_entity operations: {self.metrics.versioning_operations}")
+        print(f"   │  │  └─ complex_update operations: {self.metrics.real_operations_by_type.get('complex_update', 0)}")
+        print(f"   │  ├─ Original target entities: {original_entities}")
+        print(f"   │  └─ Expected total versions: {expected_versions}")
+        
+        if total_versions_found == expected_versions:
+            print(f"   ├─ ✅ Perfect version accounting: {total_versions_found} = {expected_versions}")
+        elif total_versions_found > 0:
             print(f"   ├─ ✅ ECS versioning verified: Entities were modified in ECS system")
+            if total_versions_found != expected_versions:
+                diff = total_versions_found - expected_versions
+                print(f"   │  └─ Note: {abs(diff)} {'extra' if diff > 0 else 'fewer'} versions (likely from structural operations)")
         else:
             print(f"   ├─ ❌ No ECS versions found: Operations may not have reached entities")
+            
+        # Explain operations that don't create versions
+        non_versioning_ops = expected_modifications - version_creating_ops
+        if non_versioning_ops > 0:
+            print(f"   ├─ Operations that succeeded without creating versions: {non_versioning_ops}")
+            print(f"   │  └─ These modify entity state but don't call force_versioning=True")
             
         # Operation Lineage Analysis (in-memory)
         print(f"\n🕵️ Operation Lineage Analysis:")
