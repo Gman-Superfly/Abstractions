@@ -406,30 +406,53 @@ def create_operation_hierarchy(operations: List[OperationEntity], parent_op: Opt
 
 
 def resolve_operation_conflicts(target_entity_id: UUID, current_operations: List[OperationEntity]) -> List[OperationEntity]:
-    """Resolve conflicts between operations targeting the same entity."""
+    """
+    Resolve conflicts between operations targeting the same entity.
+    
+    EXECUTING operations are protected from preemption - they cannot be rejected
+    once they have started execution. Only PENDING operations can be preempted.
+    """
     assert len(current_operations) > 0, "Cannot resolve conflicts for empty operation list"
     
-    priority_groups: Dict[int, List[OperationEntity]] = {}
+    # Separate executing operations (protected) from pending operations (can be preempted)
+    executing_ops = [op for op in current_operations if op.status == OperationStatus.EXECUTING]
+    pending_ops = [op for op in current_operations if op.status == OperationStatus.PENDING]
     
-    for op in current_operations:
-        effective_priority = op.get_effective_priority()
-        if effective_priority not in priority_groups:
-            priority_groups[effective_priority] = []
-        priority_groups[effective_priority].append(op)
+    # EXECUTING operations are automatically winners - they cannot be preempted
+    winning_ops = executing_ops.copy()
     
-    highest_priority = max(priority_groups.keys())
-    winning_ops = priority_groups[highest_priority]
-    
-    if len(winning_ops) > 1:
-        winning_ops.sort(key=lambda op: op.created_at)
-        winning_ops = [winning_ops[0]]
-    
-    losing_ops = [op for ops in priority_groups.values() for op in ops if op not in winning_ops]
-    
-    for op in losing_ops:
-        op.status = OperationStatus.REJECTED
-        op.completed_at = datetime.now(timezone.utc)
-        op.error_message = f"Preempted by higher priority operation {winning_ops[0].ecs_id}"
-        op.update_ecs_ids()
+    # Only resolve conflicts among PENDING operations
+    if pending_ops:
+        priority_groups: Dict[int, List[OperationEntity]] = {}
+        
+        for op in pending_ops:
+            effective_priority = op.get_effective_priority()
+            if effective_priority not in priority_groups:
+                priority_groups[effective_priority] = []
+            priority_groups[effective_priority].append(op)
+        
+        # Find highest priority among pending operations
+        highest_priority = max(priority_groups.keys())
+        highest_priority_pending = priority_groups[highest_priority]
+        
+        # If multiple operations have same highest priority, take earliest created
+        if len(highest_priority_pending) > 1:
+            highest_priority_pending.sort(key=lambda op: op.created_at)
+            highest_priority_pending = [highest_priority_pending[0]]
+        
+        # Add winning pending operation to winners
+        winning_ops.extend(highest_priority_pending)
+        
+        # Reject losing pending operations (cannot preempt executing operations)
+        losing_pending_ops = [op for ops in priority_groups.values() for op in ops if op not in highest_priority_pending]
+        
+        for op in losing_pending_ops:
+            op.status = OperationStatus.REJECTED
+            op.completed_at = datetime.now(timezone.utc)
+            if executing_ops:
+                op.error_message = f"Cannot preempt executing operation(s). Protected operations: {[str(eo.ecs_id)[:8] for eo in executing_ops]}"
+            elif highest_priority_pending:
+                op.error_message = f"Preempted by higher priority pending operation {highest_priority_pending[0].ecs_id}"
+            op.update_ecs_ids()
     
     return winning_ops

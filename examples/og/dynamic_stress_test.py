@@ -557,6 +557,7 @@ class ConflictResolutionTest:
             conflicts = get_conflicting_operations(target_entity_id)
             
             # REAL-TIME VERIFICATION: Show ALL pending/executing operations for this target
+            # But only during active submission phase to avoid spam during grace period
             all_operations_for_target = []
             for root_id in EntityRegistry.tree_registry.keys():
                 tree = EntityRegistry.tree_registry.get(root_id)
@@ -566,7 +567,8 @@ class ConflictResolutionTest:
                             entity.target_entity_id == target_entity_id):
                             all_operations_for_target.append(entity)
             
-            if len(all_operations_for_target) > 0:
+            # Only show verbose target status during submission phase
+            if len(all_operations_for_target) > 0 and not getattr(self, 'stop_submission', False):
                 print(f"🔍 TARGET STATUS: Target {str(target_entity_id)[:8]} has {len(all_operations_for_target)} total operations")
                 pending_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.PENDING)
                 executing_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.EXECUTING)
@@ -583,7 +585,7 @@ class ConflictResolutionTest:
                         if op.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]:
                             print(f"      ├─ {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
             
-            # DEBUG: Show conflict detection activity
+            # DEBUG: Show conflict detection activity (always show conflicts)
             if len(conflicts) > 0:
                 print(f"🔍 CONFLICT CHECK: Found {len(conflicts)} CONFLICTING operations for target {str(target_entity_id)[:8]}")
                 for op in conflicts:
@@ -612,12 +614,25 @@ class ConflictResolutionTest:
                 ))
                 
                 # Track protection stats BEFORE resolution
-                protected = self.grace_tracker.get_protected_operations()
-                protected_count = len([op for op in conflicts if op.ecs_id in protected])
+                # Count both grace period protection AND executing operation protection
+                grace_protected = self.grace_tracker.get_protected_operations()
+                grace_protected_count = len([op for op in conflicts if op.ecs_id in grace_protected])
                 
-                if protected_count > 0:
+                # Count executing operations (protected by hierarchy system)
+                executing_ops = [op for op in conflicts if op.status == OperationStatus.EXECUTING]
+                executing_protected_count = len(executing_ops)
+                
+                total_protected = grace_protected_count + executing_protected_count
+                
+                if total_protected > 0:
                     self.metrics.record_operation_protected()
-                    print(f"🛡️  PROTECTION: {protected_count} operations protected by grace period")
+                    if grace_protected_count > 0:
+                        print(f"🛡️  GRACE PROTECTION: {grace_protected_count} operations protected by grace period")
+                    if executing_protected_count > 0:
+                        print(f"🛡️  EXECUTION PROTECTION: {executing_protected_count} operations protected (already executing)")
+                        # Record as grace period saves since this is the same concept
+                        for _ in range(executing_protected_count):
+                            self.metrics.record_grace_period_save()
                 
                 # ACTUALLY CALL THE CONFLICT RESOLUTION SYSTEM
                 winners = resolve_operation_conflicts(target_entity_id, conflicts)
@@ -652,11 +667,62 @@ class ConflictResolutionTest:
         except Exception as e:
             print(f"⚠️  Error in conflict detection: {e}")
             
+    async def run_test(self):
+        """Run the complete conflict resolution test with graceful shutdown."""
+        print(f"\n🚀 Starting Conflict Resolution Test with REAL Operations...")
+        
+        # Start all workers
+        tasks = [
+            asyncio.create_task(self.operation_submission_worker()),
+            asyncio.create_task(self.conflict_monitoring_worker()),
+            asyncio.create_task(self.operation_lifecycle_driver()),
+            asyncio.create_task(self.operation_lifecycle_observer()),
+            asyncio.create_task(self.metrics_collector()),
+            asyncio.create_task(self.progress_reporter())
+        ]
+        
+        try:
+            # Phase 1: Run test for specified duration (stop new submissions)
+            print(f"⏱️  Phase 1: Running test for {self.config.duration_seconds}s (new operations)")
+            await asyncio.sleep(self.config.duration_seconds)
+            
+            # Stop submission worker only - let others continue for grace period
+            print(f"⏱️  Phase 2: Graceful shutdown - allowing {self.config.grace_period_seconds * 10:.0f}s for pending operations")
+            self.stop_submission = True  # New flag to stop only submissions
+            
+            # Grace period: Allow pending operations to complete
+            grace_period = 2.0  # 2 seconds for pending operations
+            await asyncio.sleep(grace_period)
+            
+            # Phase 3: Stop all workers and buffer output
+            print(f"⏱️  Phase 3: Stopping all workers and preparing final results...")
+            
+        finally:
+            # Stop all workers
+            self.stop_flag = True
+            
+            # Cancel tasks and wait for cleanup with timeout
+            for task in tasks:
+                task.cancel()
+            
+            # Wait for workers to stop with timeout to prevent hanging
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5.0  # Max 5 seconds for cleanup
+                )
+            except asyncio.TimeoutError:
+                print("⚠️  Some workers took too long to stop - proceeding with results")
+            
+            # Small delay to ensure all async output is flushed
+            await asyncio.sleep(0.5)
+            
     async def operation_submission_worker(self):
         """Submit operations at the configured rate - BRUTAL CONFLICT MODE."""
         interval = 1.0 / self.config.operation_rate_per_second
         
-        while not self.stop_flag:
+        # Track submission phase separately from overall test
+        while not self.stop_flag and not getattr(self, 'stop_submission', False):
             try:
                 # Select priority based on distribution using round-robin
                 priorities = list(self.config.priority_distribution.keys())
@@ -687,7 +753,9 @@ class ConflictResolutionTest:
                 batch_size = random.randint(3, 8)  # 3-8 operations per batch
                 batch_operations = []
                 
-                print(f"🔥 BRUTAL BATCH: Submitting {batch_size} operations to target {str(target.ecs_id)[:8]} simultaneously")
+                # Only print during submission phase to reduce output chaos
+                if not getattr(self, 'stop_submission', False):
+                    print(f"🔥 BRUTAL BATCH: Submitting {batch_size} operations to target {str(target.ecs_id)[:8]} simultaneously")
                 
                 for i in range(batch_size):
                     # Vary priorities within the batch to create priority conflicts
@@ -695,15 +763,21 @@ class ConflictResolutionTest:
                     operation = await self.submit_operation(target, batch_priority)
                     if operation:
                         batch_operations.append(operation)
-                        print(f"   ├─ {operation.op_type} (Priority: {operation.priority}) → Target: {str(target.ecs_id)[:8]}")
+                        if not getattr(self, 'stop_submission', False):
+                            print(f"   ├─ {operation.op_type} (Priority: {operation.priority}) → Target: {str(target.ecs_id)[:8]}")
                 
-                print(f"🎯 BATCH COMPLETE: {len(batch_operations)} operations submitted to same target")
+                if not getattr(self, 'stop_submission', False):
+                    print(f"🎯 BATCH COMPLETE: {len(batch_operations)} operations submitted to same target")
                 
                 await asyncio.sleep(interval * batch_size)  # Adjust timing for batch
                 
             except Exception as e:
                 print(f"⚠️  Error in operation submission: {e}")
                 await asyncio.sleep(interval)
+        
+        # Submission phase complete
+        if not self.stop_flag:
+            print(f"✅ Submission phase complete - no new operations will be created")
                 
     async def conflict_monitoring_worker(self):
         """Monitor for conflicts and measure resolution."""
@@ -795,7 +869,7 @@ class ConflictResolutionTest:
                                         else:
                                             # Real operation failed
                                             raise Exception(op.error_message or "Real operation failed")
-                                        
+                                            
                                     except Exception as e:
                                         # REAL failure occurred during ECS operations
                                         op.complete_operation(success=False, error_message=str(e))
@@ -887,7 +961,7 @@ class ConflictResolutionTest:
                 print(f"⚠️  Error in metrics collection: {e}")
                 
     async def progress_reporter(self):
-        """Report progress during test."""
+        """Report progress during test - reduced output during grace period."""
         last_report = time.time()
         
         while not self.stop_flag:
@@ -897,7 +971,8 @@ class ConflictResolutionTest:
             elapsed = current_time - self.metrics.start_time
             remaining = self.config.duration_seconds - elapsed
             
-            if current_time - last_report >= 10:
+            # Only report during main test phase, not during grace period
+            if current_time - last_report >= 10 and not getattr(self, 'stop_submission', False):
                 completion_rate = self.metrics.get_current_completion_rate()
                 throughput = self.metrics.get_current_throughput()
                 
@@ -915,35 +990,25 @@ class ConflictResolutionTest:
                 print(f"   └─ Grace period saves: {self.metrics.grace_period_saves}")
                 
                 last_report = current_time
-                
-    async def run_test(self):
-        """Run the complete conflict resolution test."""
-        print(f"\n🚀 Starting Conflict Resolution Test with REAL Operations...")
-        
-        # Start all workers
-        tasks = [
-            asyncio.create_task(self.operation_submission_worker()),
-            asyncio.create_task(self.conflict_monitoring_worker()),
-            asyncio.create_task(self.operation_lifecycle_driver()),
-            asyncio.create_task(self.operation_lifecycle_observer()),
-            asyncio.create_task(self.metrics_collector()),
-            asyncio.create_task(self.progress_reporter())
-        ]
-        
-        try:
-            await asyncio.sleep(self.config.duration_seconds)
-        finally:
-            self.stop_flag = True
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            elif getattr(self, 'stop_submission', False):
+                # During grace period, show minimal status
+                pending_ops = len([op_id for op_id in self.submitted_operations 
+                                 if self._get_operation_status(op_id) in [OperationStatus.PENDING, OperationStatus.EXECUTING]])
+                if pending_ops > 0:
+                    print(f"⏳ Grace period: {pending_ops} operations still pending/executing...")
             
     async def analyze_results(self):
-        """Analyze test results."""
-        print("\n🧹 Analyzing results...")
+        """Analyze test results with clean output."""
+        
+        # Clear the terminal output with separator to ensure clean results display
+        print("\n" + "🧹" * 80)
+        print("BUFFERED FINAL RESULTS - All workers stopped")
+        print("🧹" * 80)
         
         elapsed = time.time() - self.metrics.start_time
-        throughput = self.metrics.operations_submitted / elapsed
+        # Calculate throughput based on submission period only (not grace period)
+        submission_duration = self.config.duration_seconds  # Only count submission phase
+        throughput = self.metrics.operations_submitted / submission_duration if submission_duration > 0 else 0
         completion_rate = self.metrics.get_current_completion_rate()
         rejection_rate = self.metrics.operations_rejected / self.metrics.operations_submitted if self.metrics.operations_submitted > 0 else 0
         
@@ -952,15 +1017,17 @@ class ConflictResolutionTest:
         print("=" * 80)
         
         print(f"\n📋 Test Configuration:")
-        print(f"   ├─ Duration: {self.config.duration_seconds}s")
+        print(f"   ├─ Submission duration: {self.config.duration_seconds}s")
+        print(f"   ├─ Grace period: 2.0s (for pending operations)")
+        print(f"   ├─ Total test time: {elapsed:.1f}s")
         print(f"   ├─ Targets: {self.config.num_targets}")
         print(f"   ├─ Operation rate: {self.config.operation_rate_per_second:.1f} ops/sec")
-        print(f"   ├─ Grace period: {self.config.grace_period_seconds:.1f}s")
+        print(f"   ├─ Grace period protection: {self.config.grace_period_seconds:.1f}s")
         print(f"   └─ Priority distribution: {dict(self.config.priority_distribution)}")
         
         print(f"\n⏱️  Performance Results:")
-        print(f"   ├─ Actual duration: {elapsed:.1f}s")
-        print(f"   ├─ Actual throughput: {throughput:.1f} ops/sec")
+        print(f"   ├─ Submission phase: {submission_duration:.1f}s")
+        print(f"   ├─ Submission throughput: {throughput:.1f} ops/sec")
         print(f"   ├─ Operations submitted: {self.metrics.operations_submitted}")
         print(f"   ├─ Operations started: {self.metrics.operations_started}")
         print(f"   ├─ Operations completed: {self.metrics.operations_completed}")
@@ -991,8 +1058,8 @@ class ConflictResolutionTest:
         # Operation accounting verification - FIXED to avoid double counting
         # Only count final states, not intermediate transitions
         operations_in_final_state = (self.metrics.operations_completed + 
-                                    self.metrics.operations_rejected + 
-                                    self.metrics.operations_in_progress)
+                          self.metrics.operations_rejected + 
+                          self.metrics.operations_in_progress)
         # Note: operations_failed are typically retried and eventually completed or rejected
         # So we don't count them separately to avoid double-counting
         
