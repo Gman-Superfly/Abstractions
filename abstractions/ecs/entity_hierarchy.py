@@ -15,6 +15,20 @@ import asyncio
 
 from abstractions.ecs.entity import Entity, EntityRegistry
 from abstractions.events.events import emit_events, ProcessingEvent, ProcessedEvent, StateTransitionEvent
+
+# Import additional ECS components for proper integration
+try:
+    from abstractions.ecs.functional_api import get, promote_to_root
+except ImportError:
+    # Fallback imports if functional_api is not available
+    def get(address: str):
+        """Fallback get function."""
+        raise NotImplementedError("ECS functional API not available")
+    
+    def promote_to_root(entity):
+        """Fallback promote function."""
+        entity.promote_to_root()
+
 from abstractions.events.entity_events import (
     EntityRegistrationEvent, EntityRegisteredEvent,
     EntityVersioningEvent, EntityVersionedEvent
@@ -105,7 +119,14 @@ class OperationEntity(Entity):
                 raise OperationHierarchyError(f"Circular dependency detected in operation hierarchy")
             
             visited.add(current_op.ecs_id)
-            parent_op = EntityRegistry.get_stored_entity(root_ecs_id=None, entity_id=current_op.parent_op_id)
+            
+            # Find parent in EntityRegistry
+            parent_op = None
+            for root_id in EntityRegistry.tree_registry.keys():
+                tree = EntityRegistry.tree_registry.get(root_id)
+                if tree and current_op.parent_op_id in tree.nodes:
+                    parent_op = tree.nodes[current_op.parent_op_id]
+                    break
             
             if not parent_op or not isinstance(parent_op, OperationEntity):
                 raise OperationHierarchyError(f"Parent operation {current_op.parent_op_id} not found or invalid")
@@ -117,12 +138,16 @@ class OperationEntity(Entity):
     
     @emit_events(
         creating_factory=lambda self: StateTransitionEvent(
-            subject_id=self.ecs_id, subject_type="OperationEntity",
-            transition_type="status_update", old_state=str(self.status), new_state="executing"
+            subject_id=self.ecs_id, 
+            subject_type=type(self),
+            from_state=str(self.status),
+            to_state="executing"
         ),
         created_factory=lambda result, self: StateTransitionEvent(
-            subject_id=self.ecs_id, subject_type="OperationEntity", 
-            transition_type="status_updated", old_state="pending", new_state="executing"
+            subject_id=self.ecs_id, 
+            subject_type=type(self),
+            from_state="pending",
+            to_state="executing"
         )
     )
     def start_execution(self) -> None:
@@ -134,15 +159,17 @@ class OperationEntity(Entity):
         self.update_ecs_ids()
     
     @emit_events(
-        creating_factory=lambda self, success, error_message: StateTransitionEvent(
-            subject_id=self.ecs_id, subject_type="OperationEntity",
-            transition_type="completion", old_state=str(self.status),
-            new_state="succeeded" if success else "failed"
+        creating_factory=lambda self, success, error_message=None: StateTransitionEvent(
+            subject_id=self.ecs_id, 
+            subject_type=type(self),
+            from_state=str(self.status),
+            to_state="succeeded" if success else "failed"
         ),
-        created_factory=lambda result, self, success, error_message: StateTransitionEvent(
-            subject_id=self.ecs_id, subject_type="OperationEntity",
-            transition_type="completed", old_state="executing",
-            new_state="succeeded" if success else "failed"
+        created_factory=lambda result, self, success, error_message=None: StateTransitionEvent(
+            subject_id=self.ecs_id, 
+            subject_type=type(self),
+            from_state="executing",
+            to_state="succeeded" if success else "failed"
         )
     )
     def complete_operation(self, success: bool, error_message: Optional[str] = None) -> None:
@@ -184,7 +211,13 @@ class OperationEntity(Entity):
         current_op = self
         
         while current_op.parent_op_id:
-            parent_op = EntityRegistry.get_stored_entity(root_ecs_id=None, entity_id=current_op.parent_op_id)
+            # Find parent in EntityRegistry
+            parent_op = None
+            for root_id in EntityRegistry.tree_registry.keys():
+                tree = EntityRegistry.tree_registry.get(root_id)
+                if tree and current_op.parent_op_id in tree.nodes:
+                    parent_op = tree.nodes[current_op.parent_op_id]
+                    break
             
             if not parent_op or not isinstance(parent_op, OperationEntity):
                 raise OperationHierarchyError(f"Parent operation {current_op.parent_op_id} not found")
@@ -197,6 +230,39 @@ class OperationEntity(Entity):
             current_op = parent_op
         
         return chain
+    
+    def register_operation(self) -> None:
+        """Register this operation in the ECS system."""
+        if not self.ecs_id:
+            self.update_ecs_ids()
+        
+        # Promote to root if not already done
+        if not self.is_root_entity():
+            try:
+                promote_to_root(self)
+            except NotImplementedError:
+                # Fallback to direct promotion
+                self.promote_to_root()
+    
+    def update_operation_status(self, new_status: OperationStatus, error_message: Optional[str] = None) -> None:
+        """Update operation status with proper ECS integration."""
+        old_status = self.status
+        self.status = new_status
+        
+        if new_status in [OperationStatus.SUCCEEDED, OperationStatus.FAILED, OperationStatus.REJECTED]:
+            self.completed_at = datetime.now(timezone.utc)
+            if error_message and new_status != OperationStatus.SUCCEEDED:
+                self.error_message = error_message
+        
+        # Update ECS IDs to reflect changes
+        self.update_ecs_ids()
+    
+    @classmethod
+    def create_and_register(cls, **kwargs) -> 'OperationEntity':
+        """Create and register a new operation entity."""
+        operation = cls(**kwargs)
+        operation.register_operation()
+        return operation
 
 
 class StructuralOperation(OperationEntity):
@@ -233,12 +299,17 @@ def get_conflicting_operations(target_entity_id: UUID) -> List[OperationEntity]:
     assert target_entity_id is not None, "Target entity ID required"
     
     conflicting_ops = []
-    for root_id, tree in EntityRegistry._entity_trees.items():
-        for entity_id, entity in tree.nodes.items():
-            if (isinstance(entity, OperationEntity) and 
-                entity.target_entity_id == target_entity_id and
-                entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
-                conflicting_ops.append(entity)
+    
+    # Use EntityRegistry to find all operation entities
+    for root_id in EntityRegistry.tree_registry.keys():
+        tree = EntityRegistry.tree_registry.get(root_id)
+        if tree:
+            for entity_id, entity in tree.nodes.items():
+                if (isinstance(entity, OperationEntity) and 
+                    entity.target_entity_id == target_entity_id and
+                    entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
+                    conflicting_ops.append(entity)
+    
     return conflicting_ops
 
 
@@ -247,10 +318,15 @@ def get_operations_by_status(status: OperationStatus) -> List[OperationEntity]:
     assert isinstance(status, OperationStatus), f"Expected OperationStatus, got {type(status)}"
     
     operations = []
-    for root_id, tree in EntityRegistry._entity_trees.items():
-        for entity_id, entity in tree.nodes.items():
-            if isinstance(entity, OperationEntity) and entity.status == status:
-                operations.append(entity)
+    
+    # Use EntityRegistry to find all operation entities
+    for root_id in EntityRegistry.tree_registry.keys():
+        tree = EntityRegistry.tree_registry.get(root_id)
+        if tree:
+            for entity_id, entity in tree.nodes.items():
+                if isinstance(entity, OperationEntity) and entity.status == status:
+                    operations.append(entity)
+    
     return operations
 
 
@@ -262,17 +338,31 @@ def cleanup_completed_operations(retention_hours: int = 24, dry_run: bool = Fals
     cleaned = 0
     total = 0
     
-    for root_id, tree in list(EntityRegistry._entity_trees.items()):
-        for entity_id, entity in list(tree.nodes.items()):
-            if isinstance(entity, OperationEntity):
-                total += 1
-                if (entity.status in [OperationStatus.SUCCEEDED, OperationStatus.FAILED, OperationStatus.REJECTED] 
-                    and entity.completed_at and entity.completed_at < cutoff_time):
-                    
-                    if not dry_run:
+    # Clean from EntityRegistry
+    for root_id in list(EntityRegistry.tree_registry.keys()):
+        tree = EntityRegistry.tree_registry.get(root_id)
+        if tree:
+            entities_to_remove = []
+            for entity_id, entity in tree.nodes.items():
+                if isinstance(entity, OperationEntity):
+                    total += 1
+                    if (entity.status in [OperationStatus.SUCCEEDED, OperationStatus.FAILED, OperationStatus.REJECTED] 
+                        and entity.completed_at and entity.completed_at < cutoff_time):
+                        
+                        if not dry_run:
+                            entities_to_remove.append(entity_id)
+                        cleaned += 1
+            
+            # Remove entities outside the iteration
+            if not dry_run:
+                for entity_id in entities_to_remove:
+                    if entity_id in tree.nodes:
                         del tree.nodes[entity_id]
                         tree.node_count = len(tree.nodes)
-                    cleaned += 1
+                        
+                        # Clean up from other registry mappings
+                        if entity_id in EntityRegistry.ecs_id_to_root_id:
+                            del EntityRegistry.ecs_id_to_root_id[entity_id]
     
     return {"total": total, "cleaned": cleaned, "retention_hours": retention_hours}
 
@@ -281,13 +371,16 @@ def get_operation_stats() -> Dict[str, Any]:
     """Get operation statistics."""
     stats = {"total": 0, "by_status": {}, "by_type": {}, "by_priority": {}}
     
-    for root_id, tree in EntityRegistry._entity_trees.items():
-        for entity_id, entity in tree.nodes.items():
-            if isinstance(entity, OperationEntity):
-                stats["total"] += 1
-                stats["by_status"][entity.status.value] = stats["by_status"].get(entity.status.value, 0) + 1
-                stats["by_type"][entity.op_type] = stats["by_type"].get(entity.op_type, 0) + 1
-                stats["by_priority"][entity.priority] = stats["by_priority"].get(entity.priority, 0) + 1
+    # Collect from EntityRegistry
+    for root_id in EntityRegistry.tree_registry.keys():
+        tree = EntityRegistry.tree_registry.get(root_id)
+        if tree:
+            for entity_id, entity in tree.nodes.items():
+                if isinstance(entity, OperationEntity):
+                    stats["total"] += 1
+                    stats["by_status"][entity.status.value] = stats["by_status"].get(entity.status.value, 0) + 1
+                    stats["by_type"][entity.op_type] = stats["by_type"].get(entity.op_type, 0) + 1
+                    stats["by_priority"][entity.priority] = stats["by_priority"].get(entity.priority, 0) + 1
     
     return stats
 

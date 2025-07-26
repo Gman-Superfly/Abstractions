@@ -764,6 +764,26 @@ class AgentGetEntityFailedEvent(ProcessingEvent):
     error_type: str = Field(description="Type of error")
 
 
+class OperationInfo(BaseModel):
+    op_id: str
+    op_type: str
+    status: str
+    priority: int
+    target_entity_id: str
+    retry_count: int
+    max_retries: int
+    parent_op_id: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+class OperationList(BaseModel):
+    total_operations: int
+    operations: List[OperationInfo]
+    stats: Dict[str, Any]
+
+
 @registry_toolset.tool
 @emit_events(
     creating_factory=lambda function_name, **kwargs: AgentFunctionCallStartEvent(
@@ -1156,5 +1176,98 @@ def get_entity(root_ecs_id: str, ecs_id: str) -> Union[EntityInfo, ToolError]:
             ]
         }
     )
+
+
+@registry_toolset.tool
+async def get_operation_hierarchy() -> Union[OperationList, ToolError]:
+    """Get all operation entities and their hierarchy information."""
+    try:
+        # Try to import operation hierarchy
+        from abstractions.ecs.entity_hierarchy import get_operations_by_status, get_operation_stats, OperationStatus
+        
+        operations = []
+        
+        # Get all operations regardless of status
+        for status in OperationStatus:
+            status_ops = get_operations_by_status(status)
+            for op in status_ops:
+                operations.append(OperationInfo(
+                    op_id=str(op.ecs_id),
+                    op_type=op.op_type,
+                    status=op.status.value,
+                    priority=op.priority,
+                    target_entity_id=str(op.target_entity_id),
+                    retry_count=op.retry_count,
+                    max_retries=op.max_retries,
+                    parent_op_id=str(op.parent_op_id) if op.parent_op_id else None,
+                    error_message=op.error_message,
+                    started_at=op.started_at.isoformat() if op.started_at else None,
+                    completed_at=op.completed_at.isoformat() if op.completed_at else None
+                ))
+        
+        stats = get_operation_stats()
+        
+        return OperationList(
+            total_operations=len(operations),
+            operations=operations,
+            stats=stats
+        )
+        
+    except ImportError:
+        return ToolError(
+            error_type="module_not_available",
+            error_message="Operation hierarchy module not available",
+            suggestions=[
+                "Ensure the entity_hierarchy module is properly installed",
+                "Check if operation entities have been created"
+            ]
+        )
+    except Exception as e:
+        return ToolError(
+            error_type="operation_query_failed",
+            error_message=str(e),
+            suggestions=[
+                "Check if EntityRegistry is properly initialized",
+                "Verify operation entities are registered"
+            ]
+        )
+
+
+@registry_toolset.tool
+async def cleanup_old_operations(retention_hours: int = 24, dry_run: bool = True) -> Union[Dict[str, Any], ToolError]:
+    """Clean up old completed operations from the registry."""
+    try:
+        from abstractions.ecs.entity_hierarchy import cleanup_completed_operations
+        
+        if retention_hours <= 0:
+            return ToolError(
+                error_type="invalid_parameter",
+                error_message="retention_hours must be positive",
+                suggestions=["Use a positive number for retention_hours (e.g., 24)"]
+            )
+        
+        result = cleanup_completed_operations(retention_hours=retention_hours, dry_run=dry_run)
+        result["dry_run"] = dry_run
+        
+        return result
+        
+    except ImportError:
+        return ToolError(
+            error_type="module_not_available",
+            error_message="Operation hierarchy module not available",
+            suggestions=[
+                "Ensure the entity_hierarchy module is properly installed"
+            ]
+        )
+    except Exception as e:
+        return ToolError(
+            error_type="cleanup_failed",
+            error_message=str(e),
+            suggestions=[
+                "Check if EntityRegistry is accessible",
+                "Verify permission to modify operation entities"
+            ]
+        )
+
 
 

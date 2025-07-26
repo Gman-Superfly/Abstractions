@@ -443,6 +443,63 @@ async def format_and_display_execution(event: AgentFunctionCallCompletedEvent):
 
 
 # ============================================================================
+# OPERATION HIERARCHY EVENT OBSERVERS
+# ============================================================================
+
+# Import operation hierarchy events
+try:
+    from abstractions.events.events import (
+        OperationStartedEvent, OperationCompletedEvent, OperationConflictEvent,
+        OperationRejectedEvent, OperationRetryEvent
+    )
+    
+    @on(OperationStartedEvent)
+    async def on_operation_started(event: OperationStartedEvent):
+        """Observer for operation hierarchy start events."""
+        print(f"\n🚀 OPERATION: Started {event.op_type} operation {event.op_id}")
+        print(f"   └─ Target: {event.target_entity_id}")
+        print(f"   └─ Priority: {event.priority}")
+    
+    @on(OperationCompletedEvent)
+    async def on_operation_completed(event: OperationCompletedEvent):
+        """Observer for operation hierarchy completion events."""
+        duration = event.execution_duration_ms or 0.0
+        print(f"\n✅ OPERATION: Completed {event.op_type} operation {event.op_id}")
+        print(f"   └─ Target: {event.target_entity_id}")
+        print(f"   └─ Duration: {duration:.1f}ms")
+    
+    @on(OperationConflictEvent)
+    async def on_operation_conflict(event: OperationConflictEvent):
+        """Observer for operation conflicts."""
+        print(f"\n⚠️  OPERATION CONFLICT: {event.op_type} operation {event.op_id}")
+        print(f"   └─ Target: {event.target_entity_id}")
+        print(f"   └─ Priority: {event.priority}")
+        if event.conflicting_op_ids:
+            print(f"   └─ Conflicts with: {len(event.conflicting_op_ids)} operations")
+    
+    @on(OperationRejectedEvent)
+    async def on_operation_rejected(event: OperationRejectedEvent):
+        """Observer for operation rejections."""
+        print(f"\n❌ OPERATION REJECTED: {event.op_type} operation {event.op_id}")
+        print(f"   └─ Target: {event.target_entity_id}")
+        print(f"   └─ Reason: {event.rejection_reason}")
+        print(f"   └─ Retries: {event.retry_count}")
+    
+    @on(OperationRetryEvent)
+    async def on_operation_retry(event: OperationRetryEvent):
+        """Observer for operation retries."""
+        print(f"\n🔄 OPERATION RETRY: {event.op_type} operation {event.op_id}")
+        print(f"   └─ Target: {event.target_entity_id}")
+        print(f"   └─ Attempt: {event.retry_count}/{event.max_retries}")
+        print(f"   └─ Backoff: {event.backoff_delay_ms:.1f}ms")
+        print(f"   └─ Reason: {event.retry_reason}")
+
+except ImportError:
+    # Operation hierarchy events not available - this is fine
+    print("🔧 OBSERVER: Operation hierarchy events not available, skipping operation observers")
+
+
+# ============================================================================
 # SIMPLE EVENT OBSERVERS FOR REGISTRY AGENT TOOLS
 # ============================================================================
 

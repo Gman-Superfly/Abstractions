@@ -11,7 +11,7 @@ Updated to include operation-specific events for conflict resolution and hierarc
 
 from typing import (
     TypeVar, Generic, Type, Optional, List, Dict, Any, Set, Union, Callable,
-    Awaitable, Pattern, Tuple, cast, Protocol, runtime_checkable
+    Awaitable, Pattern, Tuple, cast, Protocol, runtime_checkable, TYPE_CHECKING
 )
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from uuid import UUID, uuid4
@@ -331,11 +331,10 @@ class SystemShutdownEvent(SystemEvent):
 # OPERATION HIERARCHY EVENTS
 # ============================================================================
 
-# Import OperationEntity for type hints - will be resolved at runtime
-# This avoids circular imports while providing type safety
-try:
+# Use TYPE_CHECKING to avoid circular imports while providing type hints
+if TYPE_CHECKING:
     from abstractions.ecs.entity_hierarchy import OperationEntity
-except ImportError:
+else:
     # Fallback for cases where entity_hierarchy isn't available yet
     OperationEntity = BaseModel
 
@@ -429,40 +428,43 @@ def setup_operation_event_handlers():
         try:
             # Import here to avoid circular dependencies
             from abstractions.ecs.functional_api import get
-            from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts
             
-            # Fetch the conflicting operation
-            # Note: Adjust the 'get' function call to match your addressing system
+            # Get the conflicting operation
             current_op = get(f"@{event.op_id}")
             if not current_op:
                 logger.error(f"Could not find operation entity {event.op_id}")
                 return
             
-            # Find all operations targeting the same entity
-            # Note: This is a placeholder - implement get_conflicting_operations 
-            # based on your entity registry/database query capabilities
-            conflicting_ops = []  # get_conflicting_operations(event.target_entity_id)
-            
-            if conflicting_ops:
-                # Use the utility function for conflict resolution
-                winning_ops = resolve_operation_conflicts(
-                    event.target_entity_id,
-                    [current_op] + conflicting_ops
-                )
+            # Try to import the conflict resolution function
+            try:
+                from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts, get_conflicting_operations
                 
-                # The losing operations have already been marked as rejected
-                # by resolve_operation_conflicts, so we just need to emit events
-                for op in conflicting_ops:
-                    if op not in winning_ops:
-                        await emit(OperationRejectedEvent(
-                            op_id=op.ecs_id,
-                            op_type=op.op_type,
-                            target_entity_id=op.target_entity_id,
-                            rejection_reason="preempted_by_higher_priority",
-                            retry_count=op.retry_count
-                        ))
-            
-            logger.info(f"Resolved conflict for operation {event.op_id} on entity {event.target_entity_id}")
+                # Find all operations targeting the same entity
+                conflicting_ops = get_conflicting_operations(event.target_entity_id)
+                
+                if conflicting_ops:
+                    # Use the utility function for conflict resolution
+                    winning_ops = resolve_operation_conflicts(
+                        event.target_entity_id,
+                        [current_op] + conflicting_ops
+                    )
+                    
+                    # The losing operations have already been marked as rejected
+                    # by resolve_operation_conflicts, so we just need to emit events
+                    for op in conflicting_ops:
+                        if op not in winning_ops:
+                            await emit(OperationRejectedEvent(
+                                op_id=op.ecs_id,
+                                op_type=op.op_type,
+                                target_entity_id=op.target_entity_id,
+                                rejection_reason="preempted_by_higher_priority",
+                                retry_count=op.retry_count
+                            ))
+                
+                logger.info(f"Resolved conflict for operation {event.op_id} on entity {event.target_entity_id}")
+                
+            except ImportError:
+                logger.warning("Operation hierarchy module not available, skipping conflict resolution")
             
         except Exception as e:
             logger.error(f"Error in conflict resolution handler: {e}", exc_info=True)
