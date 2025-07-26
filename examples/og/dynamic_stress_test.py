@@ -25,11 +25,12 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from pydantic import Field
 
-# Core imports
+# Core imports - PURE EVENT-DRIVEN (no direct function calls)
 from abstractions.ecs.entity_hierarchy import (
     OperationEntity, StructuralOperation, NormalOperation, LowPriorityOperation,
-    OperationStatus, OperationPriority,
-    get_conflicting_operations, get_operation_stats, resolve_operation_conflicts
+    OperationStatus, OperationPriority
+    # REMOVED: get_conflicting_operations, get_operation_stats, resolve_operation_conflicts
+    # These are replaced with pure event-driven ECS registry scanning
 )
 from abstractions.events.events import (
     get_event_bus, emit,
@@ -563,11 +564,20 @@ class ConflictResolutionTest:
         return None
         
     async def detect_and_resolve_conflicts(self, target_entity_id: UUID):
-        """Detect and resolve conflicts using the system's conflict resolution."""
+        """Detect and resolve conflicts using pure event-driven approach."""
         start_time = time.time()
         
         try:
-            conflicts = get_conflicting_operations(target_entity_id)
+            # PURE EVENT-DRIVEN: Find conflicts by scanning ECS registry directly (no helper functions)
+            conflicts = []
+            for root_id in EntityRegistry.tree_registry.keys():
+                tree = EntityRegistry.tree_registry.get(root_id)
+                if tree:
+                    for entity_id, entity in tree.nodes.items():
+                        if (isinstance(entity, OperationEntity) and 
+                            entity.target_entity_id == target_entity_id and
+                            entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
+                            conflicts.append(entity)
             
             # PRODUCTION VERIFICATION: Show all pending/executing operations for this target
             # But only during active submission phase to avoid spam during grace period
@@ -665,8 +675,17 @@ class ConflictResolutionTest:
                 # Give event handlers time to process
                 await asyncio.sleep(0.01)  # Small delay for event processing
                 
-                # Check results after event-driven resolution
-                resolved_conflicts = get_conflicting_operations(target_entity_id)
+                # Check results after event-driven resolution (pure ECS scan)
+                resolved_conflicts = []
+                for root_id in EntityRegistry.tree_registry.keys():
+                    tree = EntityRegistry.tree_registry.get(root_id)
+                    if tree:
+                        for entity_id, entity in tree.nodes.items():
+                            if (isinstance(entity, OperationEntity) and 
+                                entity.target_entity_id == target_entity_id and
+                                entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
+                                resolved_conflicts.append(entity)
+                
                 rejected_count = len([op for op in conflicts if op.status == OperationStatus.REJECTED])
                 winners_count = len(conflicts) - rejected_count
                 
