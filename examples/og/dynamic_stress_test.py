@@ -25,12 +25,10 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from pydantic import Field
 
-# Core imports - PURE EVENT-DRIVEN (no direct function calls)
+# Core imports - PURE EVENT-DRIVEN
 from abstractions.ecs.entity_hierarchy import (
     OperationEntity, StructuralOperation, NormalOperation, LowPriorityOperation,
     OperationStatus, OperationPriority
-    # REMOVED: get_conflicting_operations, get_operation_stats, resolve_operation_conflicts
-    # These are replaced with pure event-driven ECS registry scanning
 )
 from abstractions.events.events import (
     get_event_bus, emit,
@@ -417,6 +415,9 @@ class ConflictResolutionTest:
         self.submitted_operations: Set[UUID] = set()
         self.stop_flag = False
         
+        # Pre-ECS staging area for conflict resolution
+        self.pending_operations: Dict[UUID, List[RealOperationEntity]] = {}  # target_id -> [operations]
+        
         # Operation ID counter for unique operation names
         self.operation_counter = 0
         
@@ -502,10 +503,17 @@ class ConflictResolutionTest:
             source_entity_id=source_entity_id,
             max_retries=3
         )
-        operation.promote_to_root()
+        # DO NOT promote_to_root() yet - keep in staging area for conflict resolution
         
-        self.submitted_operations.add(operation.ecs_id)
+        # Add to pre-ECS staging area
+        if target.ecs_id not in self.pending_operations:
+            self.pending_operations[target.ecs_id] = []
+        self.pending_operations[target.ecs_id].append(operation)
+        
         self.metrics.record_operation_submitted(priority)
+        
+        # DON'T resolve conflicts immediately - let them accumulate in staging area
+        # Conflict resolution will happen after the batch is complete
         
         return operation
     
@@ -569,6 +577,7 @@ class ConflictResolutionTest:
         
         try:
             # PURE EVENT-DRIVEN: Find conflicts by scanning ECS registry directly (no helper functions)
+            # Only include PENDING operations for conflict resolution (not EXECUTING ones)
             conflicts = []
             for root_id in EntityRegistry.tree_registry.keys():
                 tree = EntityRegistry.tree_registry.get(root_id)
@@ -576,7 +585,7 @@ class ConflictResolutionTest:
                     for entity_id, entity in tree.nodes.items():
                         if (isinstance(entity, OperationEntity) and 
                             entity.target_entity_id == target_entity_id and
-                            entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
+                            entity.status == OperationStatus.PENDING):  # Only PENDING operations
                             conflicts.append(entity)
             
             # PRODUCTION VERIFICATION: Show all pending/executing operations for this target
@@ -613,6 +622,21 @@ class ConflictResolutionTest:
                 print(f"🔍 CONFLICT CHECK: Found {len(conflicts)} CONFLICTING operations for target {str(target_entity_id)[:8]}")
                 for op in conflicts:
                     print(f"   ├─ Operation {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
+            else:
+                # Show when NO conflicts found to debug timing issue
+                all_ops_for_target = []
+                for root_id in EntityRegistry.tree_registry.keys():
+                    tree = EntityRegistry.tree_registry.get(root_id)
+                    if tree:
+                        for entity_id, entity in tree.nodes.items():
+                            if (isinstance(entity, OperationEntity) and 
+                                entity.target_entity_id == target_entity_id):
+                                all_ops_for_target.append(entity)
+                
+                if len(all_ops_for_target) > 1:
+                    pending_count = len([op for op in all_ops_for_target if op.status == OperationStatus.PENDING])
+                    executing_count = len([op for op in all_ops_for_target if op.status == OperationStatus.EXECUTING])
+                    print(f"🔍 NO PENDING CONFLICTS: Target {str(target_entity_id)[:8]} has {len(all_ops_for_target)} total ops ({pending_count} pending, {executing_count} executing)")
             
             if len(conflicts) > 1:
                 self.metrics.record_conflict_detected(len(conflicts))
@@ -620,21 +644,6 @@ class ConflictResolutionTest:
                 print(f"⚔️  CONFLICT DETECTED: {len(conflicts)} operations competing for target {str(target_entity_id)[:8]}")
                 for op in conflicts:
                     print(f"   ├─ {op.op_type} (Priority: {op.priority}, Status: {op.status})")
-                
-                # Emit conflict detection event
-                await emit(OperationConflictEvent(
-                    process_name="conflict_resolution_test",
-                    op_id=conflicts[0].ecs_id,  # Primary conflicting operation
-                    op_type=conflicts[0].op_type,
-                    target_entity_id=target_entity_id,
-                    priority=conflicts[0].priority,
-                    conflict_details={
-                        "total_conflicts": len(conflicts),
-                        "conflict_priorities": [op.priority for op in conflicts],
-                        "conflict_operation_types": [getattr(op, 'operation_type', 'unknown') for op in conflicts if hasattr(op, 'operation_type')]
-                    },
-                    conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
-                ))
                 
                 # Track protection stats BEFORE resolution
                 # Count both grace period protection AND executing operation protection
@@ -657,17 +666,19 @@ class ConflictResolutionTest:
                         for _ in range(executing_protected_count):
                             self.metrics.record_grace_period_save()
                 
-                # PURE EVENT-DRIVEN CONFLICT RESOLUTION
+                # PURE EVENT-DRIVEN CONFLICT RESOLUTION  
                 await emit(OperationConflictEvent(
                     process_name="conflict_resolution_test",
-                    op_id=conflicts[0].ecs_id,  # Primary conflicting operation
+                    op_id=conflicts[0].ecs_id,
                     op_type=conflicts[0].op_type,
                     target_entity_id=target_entity_id,
                     priority=conflicts[0].priority,
                     conflict_details={
                         "total_conflicts": len(conflicts),
                         "conflict_priorities": [op.priority for op in conflicts],
-                        "conflict_operation_types": [getattr(op, 'operation_type', 'unknown') for op in conflicts if hasattr(op, 'operation_type')]
+                        "conflict_operation_types": [getattr(op, 'operation_type', 'unknown') for op in conflicts if hasattr(op, 'operation_type')],
+                        "operation_entities": conflicts,  # Pass the actual conflict entities
+                        "grace_tracker": self.grace_tracker  # Pass the grace tracker
                     },
                     conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
                 ))
@@ -675,17 +686,7 @@ class ConflictResolutionTest:
                 # Give event handlers time to process
                 await asyncio.sleep(0.01)  # Small delay for event processing
                 
-                # Check results after event-driven resolution (pure ECS scan)
-                resolved_conflicts = []
-                for root_id in EntityRegistry.tree_registry.keys():
-                    tree = EntityRegistry.tree_registry.get(root_id)
-                    if tree:
-                        for entity_id, entity in tree.nodes.items():
-                            if (isinstance(entity, OperationEntity) and 
-                                entity.target_entity_id == target_entity_id and
-                                entity.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]):
-                                resolved_conflicts.append(entity)
-                
+                # Check results after event-driven resolution
                 rejected_count = len([op for op in conflicts if op.status == OperationStatus.REJECTED])
                 winners_count = len(conflicts) - rejected_count
                 
@@ -708,15 +709,57 @@ class ConflictResolutionTest:
                 
         except Exception as e:
             print(f"⚠️  Error in conflict detection: {e}")
+    
+    async def resolve_conflicts_before_ecs(self, target_entity_id: UUID):
+        """Resolve conflicts in pre-ECS staging area before any ECS operations."""
+        pending_ops = self.pending_operations.get(target_entity_id, [])
+        
+        # DEBUG: Show staging area status
+        print(f"🔍 STAGING CHECK: Target {str(target_entity_id)[:8]} has {len(pending_ops)} pending operations")
+        
+        if len(pending_ops) > 1:
+            print(f"⚔️  PRE-ECS CONFLICT: {len(pending_ops)} operations competing for target {str(target_entity_id)[:8]}")
+            for op in pending_ops:
+                print(f"   ├─ {op.op_type} (Priority: {op.priority}, Status: PRE-ECS)")
+            
+            # Sort by priority (higher priority = higher number wins)
+            pending_ops.sort(key=lambda op: (op.priority, -op.created_at.timestamp()), reverse=True)
+            
+            # Winner is highest priority (first after sort)
+            winner = pending_ops[0]
+            losers = pending_ops[1:]
+            
+            print(f"🏆 PRE-ECS RESOLUTION: 1 winner, {len(losers)} rejected")
+            print(f"✅ WINNER: {winner.op_type} (Priority: {winner.priority})")
+            
+            # Reject losers before they enter ECS
+            for loser in losers:
+                print(f"❌ REJECTED: {loser.op_type} (Priority: {loser.priority})")
+                self.metrics.record_operation_rejected(loser.priority)
+                # Remove from staging area - they never enter ECS
+                self.pending_operations[target_entity_id].remove(loser)
+            
+            # Promote winner to ECS for execution
+            winner.promote_to_root()
+            self.submitted_operations.add(winner.ecs_id)
+            self.pending_operations[target_entity_id] = []  # Clear staging area
+            
+            print(f"🚀 PROMOTED TO ECS: {winner.op_type} (ID: {str(winner.ecs_id)[:8]})")
+            
+        elif len(pending_ops) == 1:
+            # No conflict - promote single operation to ECS
+            winner = pending_ops[0]
+            winner.promote_to_root()
+            self.submitted_operations.add(winner.ecs_id)
+            self.pending_operations[target_entity_id] = []
             
     async def run_test(self):
         """Run the complete conflict resolution test with graceful shutdown."""
         print(f"\n🚀 Starting Conflict Resolution Test with Production Operations...")
         
-        # Start all workers
+        # Start all workers (no conflict monitoring worker - conflicts detected during submission)
         tasks = [
             asyncio.create_task(self.operation_submission_worker()),
-            asyncio.create_task(self.conflict_monitoring_worker()),
             asyncio.create_task(self.operation_lifecycle_driver()),
             asyncio.create_task(self.operation_lifecycle_observer()),
             asyncio.create_task(self.metrics_collector()),
@@ -811,6 +854,9 @@ class ConflictResolutionTest:
                 if not getattr(self, 'stop_submission', False):
                     print(f"🎯 BATCH COMPLETE: {len(batch_operations)} operations submitted to same target")
                 
+                # RESOLVE CONFLICTS AFTER BATCH IS COMPLETE
+                await self.resolve_conflicts_before_ecs(target.ecs_id)
+                
                 await asyncio.sleep(interval * batch_size)  # Adjust timing for batch
                 
             except Exception as e:
@@ -823,16 +869,22 @@ class ConflictResolutionTest:
                 
     async def conflict_monitoring_worker(self):
         """Monitor for conflicts and measure resolution."""
-        while not self.stop_flag:
+        while not self.stop_flag and not getattr(self, 'stop_submission', False):
             try:
-                for target in self.target_entities:
-                    await self.detect_and_resolve_conflicts(target.ecs_id)
-                    
-                # Minimal yield for cooperative multitasking - not for timing
-                await asyncio.sleep(0)  # Yield to event loop immediately
+                # Only monitor during active submission phase
+                if not getattr(self, 'stop_submission', False):
+                    for target in self.target_entities:
+                        await self.detect_and_resolve_conflicts(target.ecs_id)
+                        
+                    # Minimal yield for cooperative multitasking - not for timing
+                    await asyncio.sleep(0.1)  # Slightly longer sleep to reduce spam
+                else:
+                    # During grace period, just sleep and check stop flag
+                    await asyncio.sleep(1.0)
                 
             except Exception as e:
                 print(f"⚠️  Error in conflict monitoring: {e}")
+                await asyncio.sleep(1.0)  # Sleep on error to prevent spam
                 
     async def operation_lifecycle_driver(self):
         """Drive operation lifecycle - start and complete production operations."""
@@ -1189,7 +1241,7 @@ class ConflictResolutionTest:
         
         # Cross-reference with operation metrics
         expected_modifications = self.metrics.entity_modifications
-        print(f"   ├─ Expected modifications (from metrics): {expected_modifications}")
+        print(f"   ├─ Total operations that modified entities: {expected_modifications}")
         print(f"   ├─ Actual ECS versions found: {total_versions_found}")
         
         # Explain the version accounting
@@ -1217,8 +1269,9 @@ class ConflictResolutionTest:
         # Explain operations that don't create versions
         non_versioning_ops = expected_modifications - version_creating_ops
         if non_versioning_ops > 0:
-            print(f"   ├─ Operations that succeeded without creating versions: {non_versioning_ops}")
-            print(f"   │  └─ These modify entity state but don't call force_versioning=True")
+            print(f"   ├─ Operations that modified state without creating versions: {non_versioning_ops}")
+            print(f"   │  └─ These operations (modify_field, borrow_attribute) update entity state")
+            print(f"   │     but don't call force_versioning=True (by design)")
             
         # Operation Lineage Analysis (in-memory)
         print(f"\n🕵️ Operation Lineage Analysis:")

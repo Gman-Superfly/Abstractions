@@ -423,24 +423,42 @@ def setup_operation_event_handlers():
         appropriate rejection events for losing operations.
         """
         try:
-            from abstractions.ecs.functional_api import get
-            from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts, get_conflicting_operations
+            from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts
             
-            # Get the conflicting operation
-            current_op = get(f"@{event.op_id}")
-            if not current_op:
-                logger.error(f"Could not find operation entity {event.op_id}")
-                return
-            
-            # Find all operations targeting the same entity
-            conflicting_ops = get_conflicting_operations(event.target_entity_id)
-            
-            if conflicting_ops:
-                # Resolve conflicts using the hierarchy system
-                winning_ops = resolve_operation_conflicts(
-                    event.target_entity_id,
-                    [current_op] + conflicting_ops
-                )
+            # Use passed operation entities and grace tracker from conflict_details
+            if "operation_entities" in event.conflict_details and "grace_tracker" in event.conflict_details:
+                # Use the entities and grace tracker passed from the test
+                conflicting_ops = event.conflict_details["operation_entities"]
+                grace_tracker = event.conflict_details["grace_tracker"]
+                
+                if conflicting_ops:
+                    # Resolve conflicts using the hierarchy system with proper arguments
+                    winning_ops = resolve_operation_conflicts(
+                        event.target_entity_id,
+                        conflicting_ops,
+                        grace_tracker
+                    )
+                else:
+                    return
+            else:
+                # Fallback to old approach (shouldn't happen in our test)
+                from abstractions.ecs.functional_api import get
+                from abstractions.ecs.entity_hierarchy import get_conflicting_operations
+                
+                current_op = get(f"@{event.op_id}")
+                if not current_op:
+                    logger.error(f"Could not find operation entity {event.op_id}")
+                    return
+                
+                conflicting_ops = get_conflicting_operations(event.target_entity_id)
+                if conflicting_ops:
+                    winning_ops = resolve_operation_conflicts(
+                        event.target_entity_id,
+                        [current_op] + conflicting_ops,
+                        None  # No grace tracker in fallback
+                    )
+                else:
+                    return
                 
                 # Emit rejection events for losing operations
                 for op in conflicting_ops:
