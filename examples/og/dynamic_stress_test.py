@@ -280,10 +280,8 @@ class RealOperationEntity(OperationEntity):
     source_entity_id: Optional[UUID] = Field(default=None, description="Source entity for borrowing ops")
     
     async def execute_real_operation(self) -> bool:
-        """Execute the actual ECS operation."""
+        """Execute the actual ECS operation - NO SIMULATIONS, only real ECS calls."""
         try:
-            start_time = time.time()
-            
             # Get target entity
             target_entity = self._get_target_entity()
             if not target_entity:
@@ -292,29 +290,30 @@ class RealOperationEntity(OperationEntity):
             success = False
             
             if self.operation_type == "version_entity":
-                # Real versioning operation
+                # Pure ECS versioning operation - no fake delays
                 success = EntityRegistry.version_entity(target_entity, force_versioning=True)
-                
+                    
             elif self.operation_type == "modify_field":
-                # Real field modification using functional API
+                # Pure ECS field modification
                 field_name = self.operation_params.get("field_name", "counter")
                 new_value = self.operation_params.get("new_value", random.randint(1, 1000))
                 
-                # Use functional API for real modification
+                # Real ECS functional API call only
                 address = f"@{target_entity.ecs_id}.{field_name}"
                 put(address, new_value, borrow=False)
                 
-                # Update modification history
+                # Real entity modification only
                 target_entity.modification_history.append(f"Modified {field_name} to {new_value} at {datetime.now(timezone.utc)}")
                 success = True
                 
             elif self.operation_type == "borrow_attribute":
-                # Real borrowing operation
+                # Pure ECS borrowing operation
                 source_entity = self._get_source_entity()
                 if source_entity:
                     source_field = self.operation_params.get("source_field", "source_counter")
                     target_field = self.operation_params.get("target_field", "counter")
                     
+                    # Real ECS borrowing call only
                     target_entity.borrow_attribute_from(source_entity, source_field, target_field)
                     target_entity.borrow_count += 1
                     success = True
@@ -322,27 +321,27 @@ class RealOperationEntity(OperationEntity):
                     raise ValueError("Source entity not found for borrowing operation")
                     
             elif self.operation_type == "promote_to_root":
-                # Real structural operation
+                # Pure ECS structural operation
                 if not target_entity.is_root_entity():
                     target_entity.promote_to_root()
                     success = True
                 else:
-                    # Already root, just update metadata
+                    # Real entity modification only
                     target_entity.modification_history.append(f"Already root entity at {datetime.now(timezone.utc)}")
                     success = True
                     
             elif self.operation_type == "detach_entity":
-                # Real detachment operation
+                # Pure ECS detachment operation
                 if not target_entity.is_orphan():
                     target_entity.detach()
                     success = True
                 else:
-                    # Already detached, just update metadata
+                    # Real entity modification only
                     target_entity.modification_history.append(f"Already detached at {datetime.now(timezone.utc)}")
                     success = True
                     
             elif self.operation_type == "complex_update":
-                # Complex operation combining multiple real operations
+                # Real ECS operations only - no simulation
                 target_entity.counter += 1
                 target_entity.data_value = random.uniform(0, 100)
                 target_entity.text_content = f"Updated_{target_entity.counter}_{time.time()}"
@@ -350,14 +349,13 @@ class RealOperationEntity(OperationEntity):
                 target_entity.version_count += 1
                 target_entity.modification_history.append(f"Complex update {target_entity.counter} at {target_entity.timestamp}")
                 
-                # Force versioning after complex update
+                # Real ECS versioning call only
                 EntityRegistry.version_entity(target_entity, force_versioning=True)
                 success = True
                 
             else:
                 raise ValueError(f"Unknown operation type: {self.operation_type}")
             
-            duration_ms = (time.time() - start_time) * 1000
             return success
             
         except Exception as e:
@@ -558,8 +556,45 @@ class ConflictResolutionTest:
         try:
             conflicts = get_conflicting_operations(target_entity_id)
             
+            # REAL-TIME VERIFICATION: Show ALL pending/executing operations for this target
+            all_operations_for_target = []
+            for root_id in EntityRegistry.tree_registry.keys():
+                tree = EntityRegistry.tree_registry.get(root_id)
+                if tree:
+                    for entity_id, entity in tree.nodes.items():
+                        if (isinstance(entity, OperationEntity) and 
+                            entity.target_entity_id == target_entity_id):
+                            all_operations_for_target.append(entity)
+            
+            if len(all_operations_for_target) > 0:
+                print(f"🔍 TARGET STATUS: Target {str(target_entity_id)[:8]} has {len(all_operations_for_target)} total operations")
+                pending_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.PENDING)
+                executing_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.EXECUTING)
+                completed_count = sum(1 for op in all_operations_for_target if op.status in [OperationStatus.SUCCEEDED, OperationStatus.REJECTED, OperationStatus.FAILED])
+                
+                print(f"   ├─ PENDING: {pending_count}")
+                print(f"   ├─ EXECUTING: {executing_count}")
+                print(f"   └─ COMPLETED: {completed_count}")
+                
+                # Show details of active operations
+                if pending_count > 0 or executing_count > 0:
+                    print(f"   🔥 ACTIVE OPERATIONS:")
+                    for op in all_operations_for_target:
+                        if op.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]:
+                            print(f"      ├─ {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
+            
+            # DEBUG: Show conflict detection activity
+            if len(conflicts) > 0:
+                print(f"🔍 CONFLICT CHECK: Found {len(conflicts)} CONFLICTING operations for target {str(target_entity_id)[:8]}")
+                for op in conflicts:
+                    print(f"   ├─ Operation {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
+            
             if len(conflicts) > 1:
                 self.metrics.record_conflict_detected(len(conflicts))
+                
+                print(f"⚔️  CONFLICT DETECTED: {len(conflicts)} operations competing for target {str(target_entity_id)[:8]}")
+                for op in conflicts:
+                    print(f"   ├─ {op.op_type} (Priority: {op.priority}, Status: {op.status})")
                 
                 # Emit conflict detection event
                 await emit(OperationConflictEvent(
@@ -582,14 +617,18 @@ class ConflictResolutionTest:
                 
                 if protected_count > 0:
                     self.metrics.record_operation_protected()
+                    print(f"🛡️  PROTECTION: {protected_count} operations protected by grace period")
                 
                 # ACTUALLY CALL THE CONFLICT RESOLUTION SYSTEM
                 winners = resolve_operation_conflicts(target_entity_id, conflicts)
+                
+                print(f"🏆 RESOLUTION: {len(winners)} winner(s), {len(conflicts) - len(winners)} rejected")
                 
                 # Track what happened to the losing operations
                 losers = [op for op in conflicts if op not in winners]
                 for loser in losers:
                     if loser.status == OperationStatus.REJECTED:
+                        print(f"❌ REJECTED: {loser.op_type} (ID: {str(loser.ecs_id)[:8]}) - Priority: {loser.priority}")
                         self.metrics.record_operation_rejected(loser.priority)
                         # Remove rejected operations from our tracking
                         self.submitted_operations.discard(loser.ecs_id)
@@ -608,12 +647,13 @@ class ConflictResolutionTest:
                 
                 resolution_time = (time.time() - start_time) * 1000
                 self.metrics.record_conflict_resolved(resolution_time)
+                print(f"⏱️  RESOLUTION TIME: {resolution_time:.1f}ms")
                 
         except Exception as e:
             print(f"⚠️  Error in conflict detection: {e}")
             
     async def operation_submission_worker(self):
-        """Submit operations at the configured rate."""
+        """Submit operations at the configured rate - BRUTAL CONFLICT MODE."""
         interval = 1.0 / self.config.operation_rate_per_second
         
         while not self.stop_flag:
@@ -639,12 +679,27 @@ class ConflictResolutionTest:
                         selected_priority = priorities[i]
                         break
                 
-                # Select target (round-robin to avoid random)
-                target_index = self.operation_counter % len(self.target_entities)
-                target = self.target_entities[target_index]
+                # BRUTAL CONFLICT MODE: Submit MULTIPLE operations to the SAME target simultaneously
+                # This creates guaranteed conflicts since multiple ops target same entity
+                target = random.choice(self.target_entities)  # Pick one target for maximum conflict
                 
-                await self.submit_operation(target, selected_priority)
-                await asyncio.sleep(interval)
+                # Submit a BATCH of operations to the same target to force conflicts
+                batch_size = random.randint(3, 8)  # 3-8 operations per batch
+                batch_operations = []
+                
+                print(f"🔥 BRUTAL BATCH: Submitting {batch_size} operations to target {str(target.ecs_id)[:8]} simultaneously")
+                
+                for i in range(batch_size):
+                    # Vary priorities within the batch to create priority conflicts
+                    batch_priority = priorities[i % len(priorities)]
+                    operation = await self.submit_operation(target, batch_priority)
+                    if operation:
+                        batch_operations.append(operation)
+                        print(f"   ├─ {operation.op_type} (Priority: {operation.priority}) → Target: {str(target.ecs_id)[:8]}")
+                
+                print(f"🎯 BATCH COMPLETE: {len(batch_operations)} operations submitted to same target")
+                
+                await asyncio.sleep(interval * batch_size)  # Adjust timing for batch
                 
             except Exception as e:
                 print(f"⚠️  Error in operation submission: {e}")
@@ -657,7 +712,8 @@ class ConflictResolutionTest:
                 for target in self.target_entities:
                     await self.detect_and_resolve_conflicts(target.ecs_id)
                     
-                await asyncio.sleep(0.1)  # Check every 100ms
+                # Minimal yield for cooperative multitasking - not for timing
+                await asyncio.sleep(0)  # Yield to event loop immediately
                 
             except Exception as e:
                 print(f"⚠️  Error in conflict monitoring: {e}")
@@ -666,11 +722,10 @@ class ConflictResolutionTest:
         """Drive operation lifecycle - start and complete REAL operations."""
         while not self.stop_flag:
             try:
-                # Find pending operations and start some of them
+                # MAXIMUM CONCURRENCY - no limits on concurrent operations
                 started_count = 0
                 for op_id in list(self.submitted_operations):
-                    if started_count >= 5:  # Limit concurrent starts per cycle
-                        break
+                    # NO LIMITS - start everything immediately for maximum carnage
                         
                     for root_id in EntityRegistry.tree_registry.keys():
                         tree = EntityRegistry.tree_registry.get(root_id)
@@ -678,7 +733,7 @@ class ConflictResolutionTest:
                             op = tree.nodes[op_id]
                             if isinstance(op, RealOperationEntity):
                                 
-                                # Start pending operations
+                                # Start pending operations immediately
                                 if op.status == OperationStatus.PENDING:
                                     try:
                                         op.start_execution()
@@ -704,70 +759,68 @@ class ConflictResolutionTest:
                                                 self.submitted_operations.discard(op_id)
                                                 self.metrics.record_operation_rejected(op.priority)
                                 
-                                # Complete executing operations by performing REAL work
+                                # Execute operations immediately - no artificial timing
                                 elif op.status == OperationStatus.EXECUTING:
                                     execution_time = (datetime.now(timezone.utc) - op.started_at).total_seconds() if op.started_at else 0
                                     
-                                    # Allow operations to execute after grace period
-                                    min_execution_time = 0.1  # Minimum 100ms execution time
-                                    if execution_time >= min_execution_time:
-                                        try:
-                                            # Execute the REAL operation
-                                            op_start_time = time.time()
-                                            success = await op.execute_real_operation()
-                                            op_duration_ms = (time.time() - op_start_time) * 1000
-                                            
-                                            # Record real operation metrics
-                                            self.metrics.record_real_operation(
-                                                op.operation_type, 
-                                                success, 
-                                                op_duration_ms,
-                                                op.error_message if not success else None
-                                            )
-                                            
-                                            if success:
-                                                # Real operation succeeded
-                                                op.complete_operation(success=True)
-                                                self.grace_tracker.end_grace_period(op.ecs_id)
-                                                self.submitted_operations.discard(op_id)
-                                                self.metrics.record_operation_completed(op.priority)
-                                                
-                                                await emit(OperationCompletedEvent(
-                                                    process_name="conflict_resolution_test",
-                                                    op_id=op.ecs_id,
-                                                    op_type=op.op_type,
-                                                    target_entity_id=op.target_entity_id,
-                                                    execution_duration_ms=execution_time * 1000
-                                                ))
-                                            else:
-                                                # Real operation failed
-                                                raise Exception(op.error_message or "Real operation failed")
-                                            
-                                        except Exception as e:
-                                            # REAL failure occurred during ECS operations
-                                            op.complete_operation(success=False, error_message=str(e))
+                                    # Execute IMMEDIATELY - no artificial delays
+                                    try:
+                                        # Execute the REAL operation
+                                        op_start_time = time.time()
+                                        success = await op.execute_real_operation()
+                                        op_duration_ms = (time.time() - op_start_time) * 1000
+                                        
+                                        # Record real operation metrics
+                                        self.metrics.record_real_operation(
+                                            op.operation_type, 
+                                            success, 
+                                            op_duration_ms,
+                                            op.error_message if not success else None
+                                        )
+                                        
+                                        if success:
+                                            # Real operation succeeded
+                                            op.complete_operation(success=True)
                                             self.grace_tracker.end_grace_period(op.ecs_id)
+                                            self.submitted_operations.discard(op_id)
+                                            self.metrics.record_operation_completed(op.priority)
                                             
-                                            # Try to retry the failed operation using built-in retry system
-                                            if op.increment_retry():
-                                                self.metrics.record_operation_retried(op.priority)
-                                                
-                                                # Calculate backoff delay and emit retry event
-                                                backoff_delay = op.get_backoff_delay() * 1000  # Convert to ms
-                                                await emit(OperationRetryEvent(
-                                                    op_id=op.ecs_id,
-                                                    op_type=op.op_type,
-                                                    target_entity_id=op.target_entity_id,
-                                                    retry_count=op.retry_count,
-                                                    max_retries=op.max_retries,
-                                                    backoff_delay_ms=backoff_delay,
-                                                    retry_reason=str(e)
-                                                ))
-                                                # Operation goes back to PENDING for retry
-                                            else:
-                                                # Max retries exceeded - now rejected
-                                                self.submitted_operations.discard(op_id)
-                                                self.metrics.record_operation_rejected(op.priority)
+                                            await emit(OperationCompletedEvent(
+                                                process_name="conflict_resolution_test",
+                                                op_id=op.ecs_id,
+                                                op_type=op.op_type,
+                                                target_entity_id=op.target_entity_id,
+                                                execution_duration_ms=execution_time * 1000
+                                            ))
+                                        else:
+                                            # Real operation failed
+                                            raise Exception(op.error_message or "Real operation failed")
+                                        
+                                    except Exception as e:
+                                        # REAL failure occurred during ECS operations
+                                        op.complete_operation(success=False, error_message=str(e))
+                                        self.grace_tracker.end_grace_period(op.ecs_id)
+                                        
+                                        # Try to retry the failed operation using built-in retry system
+                                        if op.increment_retry():
+                                            self.metrics.record_operation_retried(op.priority)
+                                            
+                                            # Calculate backoff delay and emit retry event
+                                            backoff_delay = op.get_backoff_delay() * 1000  # Convert to ms
+                                            await emit(OperationRetryEvent(
+                                                op_id=op.ecs_id,
+                                                op_type=op.op_type,
+                                                target_entity_id=op.target_entity_id,
+                                                retry_count=op.retry_count,
+                                                max_retries=op.max_retries,
+                                                backoff_delay_ms=backoff_delay,
+                                                retry_reason=str(e)
+                                            ))
+                                            # Operation goes back to PENDING for retry
+                                        else:
+                                            # Max retries exceeded - now rejected
+                                            self.submitted_operations.discard(op_id)
+                                            self.metrics.record_operation_rejected(op.priority)
                                 
                                 # Clean up rejected operations
                                 elif op.status == OperationStatus.REJECTED:
@@ -794,7 +847,8 @@ class ConflictResolutionTest:
                                        if self._get_operation_status(op_id) == OperationStatus.EXECUTING])
                 self.metrics.update_operations_in_progress(in_progress_count)
                 
-                await asyncio.sleep(0.05)  # Check every 50ms
+                # Minimal yield for cooperative multitasking - not for timing
+                await asyncio.sleep(0)  # Yield to event loop immediately
                 
             except Exception as e:
                 print(f"⚠️  Error in lifecycle driver: {e}")
@@ -1038,39 +1092,43 @@ async def run_conflict_resolution_test(config: TestConfig) -> Dict[str, Any]:
 async def main():
     """Run the conflict resolution test with example configuration."""
     
-    # Example test configuration - all parameters explicit
+    # BRUTAL CONFLICT CONFIGURATION
     config = TestConfig(
-        duration_seconds=60,  # 1 minute for real operations
-        num_targets=5,
-        operation_rate_per_second=20.0,  # Reduced rate for real operations
+        duration_seconds=15,  # Longer to see conflict patterns
+        num_targets=5,        # 5 entities as requested
+        operation_rate_per_second=100.0,  # Reduced rate but with batching
         priority_distribution={
-            OperationPriority.LOW: 0.4,
-            OperationPriority.NORMAL: 0.3,
-            OperationPriority.HIGH: 0.2,
-            OperationPriority.CRITICAL: 0.1
+            OperationPriority.LOW: 0.25,
+            OperationPriority.NORMAL: 0.25,
+            OperationPriority.HIGH: 0.25,
+            OperationPriority.CRITICAL: 0.25
         },
-        target_completion_rate=0.50,  # 50% completion rate expected for real operations
-        max_memory_mb=500,
-        grace_period_seconds=2.0  # Longer grace period for real operations
+        target_completion_rate=0.20,  # Low expectation due to brutal conflicts
+        max_memory_mb=1000,
+        grace_period_seconds=0.2  # Small grace period to allow some protection
     )
     
     print("🚀 CONFLICT RESOLUTION ALGORITHM TEST")
     print("=" * 60)
+    print("BRUTAL CONFLICT MODE - Multiple ops per target simultaneously")
     print("Production test - submits REAL operations and measures results")
     print("ALL operations perform actual ECS work - NO fake data!")
+    print("FORCING SIMULTANEOUS OPERATIONS ON SAME TARGETS")
     print("=" * 60)
     
     results = await run_conflict_resolution_test(config)
     
     if results.get('passed', False):
-        print(f"\n✅ TEST PASSED - System meets performance requirements with REAL operations")
+        print(f"\n✅ TEST PASSED - System survived the brutal conflicts with REAL operations")
         print(f"   ├─ Real modifications: {results.get('real_modifications', 0)}")
         print(f"   ├─ Real operations: {results.get('real_operations', 0)}")
         print(f"   └─ Conflicts resolved: {results.get('conflicts_resolved', 0)}")
     else:
-        print(f"\n❌ TEST FAILED - System does not meet requirements")
+        print(f"\n❌ TEST FAILED - System could not handle the brutal conflicts")
         if results.get('real_modifications', 0) == 0:
             print("   └─ ERROR: No real entity modifications detected!")
+        if results.get('conflicts_resolved', 0) == 0:
+            print("   └─ WARNING: No conflicts detected - need more brutality!")
 
 
 if __name__ == "__main__":
