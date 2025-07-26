@@ -5,6 +5,8 @@ This module provides a generic, type-safe event system that enables reactive com
 patterns while maintaining strict separation from the ECS data layer. Events are lightweight
 signals that reference entities by UUID and type, supporting parent-child relationships,
 efficient routing, and comprehensive observability.
+
+Updated to include operation-specific events for conflict resolution and hierarchy support.
 """
 
 from typing import (
@@ -323,6 +325,216 @@ class SystemShutdownEvent(SystemEvent):
     type: str = "system.shutdown"
     phase: EventPhase = EventPhase.STARTED
     reason: str = Field(default="normal", description="Shutdown reason")
+
+
+# ============================================================================
+# OPERATION HIERARCHY EVENTS
+# ============================================================================
+
+# Import OperationEntity for type hints - will be resolved at runtime
+# This avoids circular imports while providing type safety
+try:
+    from abstractions.ecs.entity_hierarchy import OperationEntity
+except ImportError:
+    # Fallback for cases where entity_hierarchy isn't available yet
+    OperationEntity = BaseModel
+
+
+class OperationStartedEvent(ProcessingEvent):
+    """Emitted when an operation starts execution."""
+    type: str = "operation.started"
+    op_id: UUID = Field(description="ID of the OperationEntity")
+    op_type: str = Field(description="Type of operation (e.g., 'version_entity')")
+    priority: int = Field(description="Operation priority")
+    target_entity_id: UUID = Field(description="ID of target entity being operated on")
+
+
+class OperationCompletedEvent(ProcessedEvent):
+    """Emitted when an operation completes successfully."""
+    type: str = "operation.completed"
+    op_id: UUID = Field(description="ID of the OperationEntity")
+    op_type: str = Field(description="Type of operation")
+    target_entity_id: UUID = Field(description="ID of target entity")
+    execution_duration_ms: Optional[float] = Field(default=None, description="Operation duration")
+
+
+class OperationConflictEvent(Event):
+    """Emitted when a conflict is detected during operation execution."""
+    type: str = "operation.conflict"
+    phase: EventPhase = EventPhase.PROGRESS
+    op_id: UUID = Field(description="ID of the conflicting OperationEntity")
+    op_type: str = Field(description="Type of operation")
+    target_entity_id: UUID = Field(description="ID of target entity")
+    priority: int = Field(description="Operation priority")
+    conflict_details: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="Conflict details (version numbers, timestamps, etc.)"
+    )
+    conflicting_op_ids: List[UUID] = Field(
+        default_factory=list,
+        description="IDs of other conflicting operations"
+    )
+
+
+class OperationRejectedEvent(StateTransitionEvent):
+    """Emitted when an operation is rejected due to conflict or max retries."""
+    type: str = "operation.rejected"
+    op_id: UUID = Field(description="ID of the rejected OperationEntity")
+    op_type: str = Field(description="Type of operation")
+    target_entity_id: UUID = Field(description="ID of target entity")
+    from_state: str = Field(default="executing", description="Previous operation state")
+    to_state: str = Field(default="rejected", description="New operation state")
+    rejection_reason: str = Field(
+        description="Reason for rejection (e.g., 'preempted_by_higher_priority', 'max_retries_exceeded')"
+    )
+    retry_count: int = Field(default=0, description="Number of retry attempts made")
+
+
+class OperationRetryEvent(Event):
+    """Emitted when an operation is retrying after a failure."""
+    type: str = "operation.retry"
+    phase: EventPhase = EventPhase.STARTED
+    op_id: UUID = Field(description="ID of the retrying OperationEntity")
+    op_type: str = Field(description="Type of operation")
+    target_entity_id: UUID = Field(description="ID of target entity")
+    retry_count: int = Field(description="Current retry attempt number")
+    max_retries: int = Field(description="Maximum retries allowed")
+    backoff_delay_ms: float = Field(description="Delay before retry in milliseconds")
+    retry_reason: str = Field(description="Reason for retry")
+
+
+# ============================================================================
+# EXAMPLE OPERATION CONFLICT RESOLUTION HANDLERS
+# ============================================================================
+
+def setup_operation_event_handlers():
+    """
+    Set up example event handlers for operation conflict resolution.
+    
+    Call this function to register the conflict resolution handlers.
+    These are examples that can be customized for your specific needs.
+    """
+    
+    @on(OperationConflictEvent)
+    async def resolve_operation_conflict(event: OperationConflictEvent):
+        """
+        Handler to resolve conflicts based on priority and hierarchy.
+        
+        This example handler demonstrates priority-based conflict resolution:
+        1. Compare operation priorities
+        2. Handle hierarchical relationships (parent-child operations)
+        3. Use timestamps as tiebreakers
+        4. Emit rejection events for losing operations
+        """
+        try:
+            # Import here to avoid circular dependencies
+            from abstractions.ecs.functional_api import get
+            from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts
+            
+            # Fetch the conflicting operation
+            # Note: Adjust the 'get' function call to match your addressing system
+            current_op = get(f"@{event.op_id}")
+            if not current_op:
+                logger.error(f"Could not find operation entity {event.op_id}")
+                return
+            
+            # Find all operations targeting the same entity
+            # Note: This is a placeholder - implement get_conflicting_operations 
+            # based on your entity registry/database query capabilities
+            conflicting_ops = []  # get_conflicting_operations(event.target_entity_id)
+            
+            if conflicting_ops:
+                # Use the utility function for conflict resolution
+                winning_ops = resolve_operation_conflicts(
+                    event.target_entity_id,
+                    [current_op] + conflicting_ops
+                )
+                
+                # The losing operations have already been marked as rejected
+                # by resolve_operation_conflicts, so we just need to emit events
+                for op in conflicting_ops:
+                    if op not in winning_ops:
+                        await emit(OperationRejectedEvent(
+                            op_id=op.ecs_id,
+                            op_type=op.op_type,
+                            target_entity_id=op.target_entity_id,
+                            rejection_reason="preempted_by_higher_priority",
+                            retry_count=op.retry_count
+                        ))
+            
+            logger.info(f"Resolved conflict for operation {event.op_id} on entity {event.target_entity_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in conflict resolution handler: {e}", exc_info=True)
+    
+    @on(OperationRejectedEvent)
+    async def handle_operation_rejection(event: OperationRejectedEvent):
+        """
+        Handler for cleanup and logging when operations are rejected.
+        
+        This handler can be customized to:
+        1. Log rejection events for monitoring
+        2. Update parent operations about child failures
+        3. Trigger compensation or rollback logic
+        4. Notify external systems about operation failures
+        """
+        try:
+            logger.warning(
+                f"Operation {event.op_type} (ID: {event.op_id}) rejected: {event.rejection_reason}. "
+                f"Retry count: {event.retry_count}"
+            )
+            
+            # Optional: Update parent operations in hierarchy
+            from abstractions.ecs.functional_api import get
+            op = get(f"@{event.op_id}")
+            if op and op.parent_op_id:
+                parent_op = get(f"@{op.parent_op_id}")
+                if parent_op:
+                    # Could update parent's failed children count or emit parent events
+                    logger.info(f"Child operation {event.op_id} rejected under parent {op.parent_op_id}")
+            
+            # Optional: Trigger compensation logic or external notifications
+            # await notify_external_system_of_rejection(event)
+            
+        except Exception as e:
+            logger.error(f"Error in rejection handler: {e}", exc_info=True)
+    
+    @on(OperationRetryEvent)
+    async def handle_operation_retry(event: OperationRetryEvent):
+        """
+        Handler for operation retry events.
+        
+        Logs retry attempts and can be extended to:
+        1. Update retry statistics
+        2. Implement adaptive retry strategies
+        3. Alert on excessive retries
+        """
+        try:
+            logger.info(
+                f"Operation {event.op_type} (ID: {event.op_id}) retrying: "
+                f"attempt {event.retry_count}/{event.max_retries}, "
+                f"backoff: {event.backoff_delay_ms}ms"
+            )
+            
+            # Alert if approaching max retries
+            if event.retry_count >= event.max_retries * 0.8:
+                logger.warning(
+                    f"Operation {event.op_id} approaching max retries "
+                    f"({event.retry_count}/{event.max_retries})"
+                )
+            
+        except Exception as e:
+            logger.error(f"Error in retry handler: {e}", exc_info=True)
+    
+    @on(pattern="operation.*")
+    def log_all_operation_events(event: Event):
+        """
+        Handler that logs all operation-related events for debugging.
+        
+        This can be useful during development or for comprehensive audit trails.
+        Remove or disable in production if too verbose.
+        """
+        logger.debug(f"Operation event: {event.type} - {event.id}")
 
 
 # ============================================================================
@@ -1553,6 +1765,11 @@ class EventSerializer:
             'validated': ValidatedEvent,
             'deleting': DeletingEvent,
             'deleted': DeletedEvent,
+            'operation.started': OperationStartedEvent,
+            'operation.completed': OperationCompletedEvent,
+            'operation.conflict': OperationConflictEvent,
+            'operation.rejected': OperationRejectedEvent,
+            'operation.retry': OperationRetryEvent,
         }
         
         event_class = type_map.get(event_type, Event)
@@ -1651,12 +1868,16 @@ __all__ = [
     'RelationshipCreatedEvent', 'RelationshipRemovedEvent',
     'SystemEvent', 'SystemStartupEvent', 'SystemShutdownEvent',
     
+    # Operation hierarchy events
+    'OperationStartedEvent', 'OperationCompletedEvent', 
+    'OperationConflictEvent', 'OperationRejectedEvent', 'OperationRetryEvent',
+    
     # Decorators
     'on', 'emit_events', 'track_state_transition',
     
     # Functions
     'emit', 'emit_and_wait', 'event_context', 'create_event_chain',
-    'get_event_bus',
+    'get_event_bus', 'setup_operation_event_handlers',
     
     # Utilities
     'EventSerializer', 'EventBusMonitor',
