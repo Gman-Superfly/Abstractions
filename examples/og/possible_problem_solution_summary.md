@@ -43,7 +43,7 @@ Introduce a **pre-ECS staging area** with priority-based conflict resolution. Op
 - **Clean Rejection**: Losers never get ECS IDs, no cleanup required
 
 **Code Example**:
-```python
+  ```python
 # Step 1: Submit to staging area (NOT ECS yet)
 brutal_op = BrutalOperationEntity(...)
 # DON'T call promote_to_root() yet!
@@ -67,7 +67,7 @@ async def resolve_conflicts_before_ecs(self, target_entity_id: UUID):
         # Losers rejected before ECS entry (no cleanup needed)
         for loser in losers:
             self.metrics.record_operation_rejected(loser.priority)
-```
+  ```
 
 ### Benefits
 - **Resource Efficiency**: Only winning operations consume ECS resources
