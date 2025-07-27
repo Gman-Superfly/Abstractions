@@ -624,8 +624,46 @@ This test validates **production scenarios**:
 - **Memory Usage**: <100MB for sustained operation
 - **Success Rate**: 100% for operations that start execution
 
+## ECS Zombie Cleanup Demonstration
+
+The test includes a **comprehensive ECS zombie cleanup demonstration** that validates cleanup strategies for operations that enter ECS but get rejected by grace period protection (the "ECS pollution problem").
+
+### Zombie Cleanup Strategies Validated
+
+1. **Immediate Cleanup (Aggressive)**: Removes zombies immediately upon rejection
+2. **Deferred Cleanup (Conservative)**: Marks zombies for cleanup within 30 minutes  
+3. **Lazy Cleanup (On-Demand)**: Cleans zombies during normal ECS queries
+
+### Production Recommendations
+
+Based on comprehensive stress testing, the system provides specific recommendations:
+
+#### For High-Throughput Systems
+- Use **Hybrid Strategy** 
+- **Immediate cleanup** for critical/resource-heavy operations
+- **Deferred cleanup (15min)** for debuggable operations
+- **Lazy cleanup** for standard operations
+- Monitor zombie count, age, and cleanup latency
+
+#### For Debug-Heavy Environments
+- Use **Deferred Strategy** with 2-hour retention
+- Monitor zombie count, age, and cleanup latency
+
+#### For Resource-Constrained Systems
+- Use **Immediate Strategy (aggressive)**
+- Monitor zombie count, age, and cleanup latency
+
+### Cleanup Effectiveness Metrics
+
+The test demonstrates **100% cleanup effectiveness** by showing:
+- **Realtime cleanup**: Immediate removal percentage
+- **Timed cleanup remaining**: Scheduled for deferred cleanup (30min)
+- **Total effectiveness**: 100% (all zombies handled)
+
+See `ecs_cleanup_strategies.md` for complete implementation details and production patterns.
+
 ## Conclusion
 
-The Dynamic Stress Test represents a **comprehensive validation system** for our ECS conflict resolution capabilities. It proves that our hierarchy-based operation system, versioning mechanisms, and priority-based conflict resolution work correctly under **brutal concurrent conditions** with **real operations performing actual work**.
+The Dynamic Stress Test represents a **comprehensive validation system** for our ECS conflict resolution capabilities. It proves that our hierarchy-based operation system, versioning mechanisms, priority-based conflict resolution, and **zombie cleanup strategies** work correctly under **brutal concurrent conditions** with **real operations performing actual work**.
 
-This test provides confidence that the system can handle **production workloads** with high concurrency, complex priority relationships, and real-time conflict resolution requirements. 
+This test provides confidence that the system can handle **production workloads** with high concurrency, complex priority relationships, real-time conflict resolution requirements, and **proper cleanup of rejected operations**. 
