@@ -152,7 +152,7 @@ class BrutalityMetrics:
         
         # System resource tracking
         self.memory_samples: List[float] = []
-        self.cpu_samples: List[float] = []
+
         self.peak_memory_mb = 0.0
         self.peak_operations_in_progress = 0
         
@@ -207,11 +207,9 @@ class BrutalityMetrics:
         try:
             process = psutil.Process()
             memory_mb = process.memory_info().rss / 1024 / 1024
-            cpu_percent = process.cpu_percent()
             
             with self.lock:
                 self.memory_samples.append(memory_mb)
-                self.cpu_samples.append(cpu_percent)
                 self.peak_memory_mb = max(self.peak_memory_mb, memory_mb)
         except:
             pass
@@ -1022,11 +1020,7 @@ class TotalBrutalityTest:
             avg_memory = statistics.mean(self.metrics.memory_samples)
             print(f"   Average memory: {avg_memory:.1f} MB")
         
-        if self.metrics.cpu_samples:
-            avg_cpu = statistics.mean(self.metrics.cpu_samples)
-            max_cpu = max(self.metrics.cpu_samples)
-            print(f"   Average CPU: {avg_cpu:.1f}%")
-            print(f"   Peak CPU: {max_cpu:.1f}%")
+
         
         # Final verdict - focus on what matters: data integrity and conflict resolution
         print(f"\n🎯 BRUTALITY TEST VERDICT:")

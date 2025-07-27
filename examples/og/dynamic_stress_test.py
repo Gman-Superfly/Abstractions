@@ -124,7 +124,7 @@ class ConflictResolutionMetrics:
         self.resolution_times = []
         self.conflict_sizes = []
         self.memory_samples = []
-        self.cpu_samples = []
+
         self.real_operation_durations = []
         
     def _get_priority_name(self, priority):
@@ -203,7 +203,6 @@ class ConflictResolutionMetrics:
         try:
             process = psutil.Process()
             self.memory_samples.append(process.memory_info().rss / 1024 / 1024)  # MB
-            self.cpu_samples.append(process.cpu_percent())
         except:
             pass
             
