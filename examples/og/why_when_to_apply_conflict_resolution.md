@@ -517,7 +517,10 @@ from abstractions.ecs.entity_hierarchy import OperationPriority
 
 # Explicit conflict resolution for specific operations
 @CallableRegistry.register("process_student_cohort")
-@with_conflict_resolution(pre_ecs=True, occ=True, priority=OperationPriority.HIGH)
+@with_conflict_resolution(
+    pre_ecs=PreECSConfig(enabled=True, priority=OperationPriority.HIGH),
+    occ=OCCConfig(enabled=True)
+)
 def process_student_cohort(cohort: List[Student]) -> List[AnalysisResult]:
     # Two-stage protection applied automatically
     pass
@@ -626,17 +629,19 @@ from abstractions.ecs.conflict_decorators import (
 )
 
 # Custom configuration for complex operations
-@with_conflict_resolution(config=ConflictResolutionConfig(
+@with_conflict_resolution(
     mode=ConflictResolutionMode.BOTH,
     pre_ecs=PreECSConfig(
+        enabled=True,
         priority=OperationPriority.CRITICAL,
         staging_timeout_ms=150.0
     ),
     occ=OCCConfig(
+        enabled=True,
         max_retries=15,
         backoff_factor=2.0
     )
-))
+)
 async def optimize_schedules(students: List[Student]) -> List[Schedule]:
     # Custom two-stage protection with tuned parameters
     pass
@@ -659,6 +664,16 @@ Two-stage protection adds minimal overhead only where needed:
 - **OCC validation**: Nanoseconds for version/timestamp comparison  
 - **Retry logic**: Only on actual conflicts (rare in well-designed systems)
 - **Memory efficiency**: Only winning operations consume ECS resources
+
+## Additional Documentation
+
+For comprehensive implementation details and production guidance, see:
+
+- **`staging_coordinator.md`** - Complete staging coordinator architecture and implementation
+- **`Decorator/decorator_conflict_reference.md`** - Comprehensive decorator usage guide
+- **`ecs_cleanup_strategies_current.md`** - Manual cleanup patterns for production systems
+- **`future_considerations_cleanup.md`** - Roadmap for decorator cleanup integration
+- **`possible_problem_solution_summary.md`** - Technical implementation details and validation results
 
 ## Conclusion
 

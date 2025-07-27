@@ -319,13 +319,13 @@ async def _execute_winning_operation(operation: ConflictResolutionOperation):
         
         operation.start_execution()
         
-        # Execute the actual function
-        func = operation.function_args[0] if operation.function_args else None
-        args = operation.function_args[1:] if len(operation.function_args) > 1 else ()
-        kwargs = operation.function_kwargs
+        # Execute the actual function with the ORIGINAL decorator arguments
+        stored_function = operation.get_stored_function()
+        original_args = operation.function_args  # These are the original *args from decorator call
+        original_kwargs = operation.function_kwargs  # These are the original **kwargs from decorator call
         
-        # Store function separately during operation creation
-        result = await operation._execute_function(operation.get_stored_function(), *args, **kwargs)
+        # Execute the stored function with the original arguments
+        result = await operation._execute_function(stored_function, *original_args, **original_kwargs)
         
         operation.complete_operation(success=True)
         operation.execution_result = result
