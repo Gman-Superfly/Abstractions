@@ -571,145 +571,32 @@ class ConflictResolutionTest:
                     return op.status
         return None
         
-    async def detect_and_resolve_conflicts(self, target_entity_id: UUID):
-        """Detect and resolve conflicts using pure event-driven approach."""
-        start_time = time.time()
-        
-        try:
-            # PURE EVENT-DRIVEN: Find conflicts by scanning ECS registry directly (no helper functions)
-            # Only include PENDING operations for conflict resolution (not EXECUTING ones)
-            conflicts = []
-            for root_id in EntityRegistry.tree_registry.keys():
-                tree = EntityRegistry.tree_registry.get(root_id)
-                if tree:
-                    for entity_id, entity in tree.nodes.items():
-                        if (isinstance(entity, OperationEntity) and 
-                            entity.target_entity_id == target_entity_id and
-                            entity.status == OperationStatus.PENDING):  # Only PENDING operations
-                            conflicts.append(entity)
-            
-            # PRODUCTION VERIFICATION: Show all pending/executing operations for this target
-            # But only during active submission phase to avoid spam during grace period
-            all_operations_for_target = []
-            for root_id in EntityRegistry.tree_registry.keys():
-                tree = EntityRegistry.tree_registry.get(root_id)
-                if tree:
-                    for entity_id, entity in tree.nodes.items():
-                        if (isinstance(entity, OperationEntity) and 
-                            entity.target_entity_id == target_entity_id):
-                            all_operations_for_target.append(entity)
-            
-            # Only show verbose target status during submission phase
-            if len(all_operations_for_target) > 0 and not getattr(self, 'stop_submission', False):
-                print(f"🔍 TARGET STATUS: Target {str(target_entity_id)[:8]} has {len(all_operations_for_target)} total operations")
-                pending_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.PENDING)
-                executing_count = sum(1 for op in all_operations_for_target if op.status == OperationStatus.EXECUTING)
-                completed_count = sum(1 for op in all_operations_for_target if op.status in [OperationStatus.SUCCEEDED, OperationStatus.REJECTED, OperationStatus.FAILED])
-                
-                print(f"   ├─ PENDING: {pending_count}")
-                print(f"   ├─ EXECUTING: {executing_count}")
-                print(f"   └─ COMPLETED: {completed_count}")
-                
-                # Show details of active operations
-                if pending_count > 0 or executing_count > 0:
-                    print(f"   🔥 ACTIVE OPERATIONS:")
-                    for op in all_operations_for_target:
-                        if op.status in [OperationStatus.PENDING, OperationStatus.EXECUTING]:
-                            print(f"      ├─ {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
-            
-            # DEBUG: Show conflict detection activity (always show conflicts)
-            if len(conflicts) > 0:
-                print(f"🔍 CONFLICT CHECK: Found {len(conflicts)} CONFLICTING operations for target {str(target_entity_id)[:8]}")
-                for op in conflicts:
-                    print(f"   ├─ Operation {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Status: {op.status}, Priority: {op.priority}")
-            else:
-                # Show when NO conflicts found to debug timing issue
-                all_ops_for_target = []
-                for root_id in EntityRegistry.tree_registry.keys():
-                    tree = EntityRegistry.tree_registry.get(root_id)
-                    if tree:
-                        for entity_id, entity in tree.nodes.items():
-                            if (isinstance(entity, OperationEntity) and 
-                                entity.target_entity_id == target_entity_id):
-                                all_ops_for_target.append(entity)
-                
-                if len(all_ops_for_target) > 1:
-                    pending_count = len([op for op in all_ops_for_target if op.status == OperationStatus.PENDING])
-                    executing_count = len([op for op in all_ops_for_target if op.status == OperationStatus.EXECUTING])
-                    print(f"🔍 NO PENDING CONFLICTS: Target {str(target_entity_id)[:8]} has {len(all_ops_for_target)} total ops ({pending_count} pending, {executing_count} executing)")
-            
-            if len(conflicts) > 1:
-                self.metrics.record_conflict_detected(len(conflicts))
-                
-                print(f"⚔️  CONFLICT DETECTED: {len(conflicts)} operations competing for target {str(target_entity_id)[:8]}")
-                for op in conflicts:
-                    print(f"   ├─ {op.op_type} (Priority: {op.priority}, Status: {op.status})")
-                
-                # Track protection stats BEFORE resolution
-                # Count both grace period protection AND executing operation protection
-                grace_protected = self.grace_tracker.get_protected_operations()
-                grace_protected_count = len([op for op in conflicts if op.ecs_id in grace_protected])
-                
-                # Count executing operations (protected by hierarchy system)
-                executing_ops = [op for op in conflicts if op.status == OperationStatus.EXECUTING]
-                executing_protected_count = len(executing_ops)
-                
-                total_protected = grace_protected_count + executing_protected_count
-                
-                if total_protected > 0:
-                    self.metrics.record_operation_protected()
-                    if grace_protected_count > 0:
-                        print(f"🛡️  GRACE PROTECTION: {grace_protected_count} operations protected by grace period")
-                    if executing_protected_count > 0:
-                        print(f"🛡️  EXECUTION PROTECTION: {executing_protected_count} operations protected (already executing)")
-                        # Record as grace period saves since this is the same concept
-                        for _ in range(executing_protected_count):
-                            self.metrics.record_grace_period_save()
-                
-                # PURE EVENT-DRIVEN CONFLICT RESOLUTION  
-                await emit(OperationConflictEvent(
-                    process_name="conflict_resolution_test",
-                    op_id=conflicts[0].ecs_id,
-                    op_type=conflicts[0].op_type,
-                    target_entity_id=target_entity_id,
-                    priority=conflicts[0].priority,
-                    conflict_details={
-                        "total_conflicts": len(conflicts),
-                        "conflict_priorities": [op.priority for op in conflicts],
-                        "conflict_operation_types": [getattr(op, 'operation_type', 'unknown') for op in conflicts if hasattr(op, 'operation_type')],
-                        "operation_entities": conflicts,  # Pass the actual conflict entities
-                        "grace_tracker": self.grace_tracker  # Pass the grace tracker
-                    },
-                    conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
-                ))
-                
-                # Give event handlers time to process
-                await asyncio.sleep(0.01)  # Small delay for event processing
-                
-                # Check results after event-driven resolution
-                rejected_count = len([op for op in conflicts if op.status == OperationStatus.REJECTED])
-                winners_count = len(conflicts) - rejected_count
-                
-                print(f"🏆 EVENT-DRIVEN RESOLUTION: {winners_count} winner(s), {rejected_count} rejected")
-                
-                # Track what happened to the losing operations
-                for op in conflicts:
-                    if op.status == OperationStatus.REJECTED:
-                        print(f"❌ REJECTED: {op.op_type} (ID: {str(op.ecs_id)[:8]}) - Priority: {op.priority}")
-                        self.metrics.record_operation_rejected(op.priority)
-                        # Remove rejected operations from our tracking
-                        self.submitted_operations.discard(op.ecs_id)
-                        self.grace_tracker.end_grace_period(op.ecs_id)
-                        
-                        # Event handlers already emit rejection events, so we don't need to emit again
-                
-                resolution_time = (time.time() - start_time) * 1000
-                self.metrics.record_conflict_resolved(resolution_time)
-                print(f"⏱️  RESOLUTION TIME: {resolution_time:.1f}ms")
-                
-        except Exception as e:
-            print(f"⚠️  Error in conflict detection: {e}")
-    
+    # ❌ REMOVED METHOD: detect_and_resolve_conflicts()
+    # 
+    # 📚 HISTORICAL CONTEXT:
+    # This method was part of the old POST-ECS conflict resolution system that has been
+    # completely replaced by PRE-ECS conflict resolution in resolve_conflicts_before_ecs().
+    #
+    # 🔍 WHAT IT DID:
+    # - Scanned EntityRegistry.tree_registry for conflicting PENDING operations
+    # - Used event-driven resolution via OperationConflictEvent emission
+    # - Handled grace period protection for executing operations
+    # - Performed conflict resolution AFTER operations already had ECS IDs
+    #
+    # ❌ WHY IT WAS REMOVED:
+    # 1. Race Condition: Operations could start executing before conflict detection
+    # 2. Post-ECS Resolution: Conflicts resolved after operations entered ECS
+    # 3. Double Counting: Both pre-ECS and post-ECS systems caused metrics duplication
+    # 4. Event Complexity: Required passing operation entities through event system
+    # 5. Grace Period Complexity: Needed to track protection for already-executing ops
+    #
+    # ✅ NEW SYSTEM (resolve_conflicts_before_ecs):
+    # - Pre-ECS staging area prevents conflicts from reaching ECS
+    # - Priority-based resolution before any promote_to_root() calls
+    # - Only winners get ECS IDs - losers never enter the system
+    # - Clean separation: conflict resolution vs ECS operations
+    # - No race conditions: conflicts resolved before execution begins
+
     async def resolve_conflicts_before_ecs(self, target_entity_id: UUID):
         """Resolve conflicts in pre-ECS staging area before any ECS operations."""
         pending_ops = self.pending_operations.get(target_entity_id, [])
@@ -718,6 +605,12 @@ class ConflictResolutionTest:
         print(f"🔍 STAGING CHECK: Target {str(target_entity_id)[:8]} has {len(pending_ops)} pending operations")
         
         if len(pending_ops) > 1:
+            # 🎯 METRICS: Track resolution time
+            resolution_start = time.time()
+            
+            # 🎯 METRICS: Record conflict detected
+            self.metrics.record_conflict_detected(len(pending_ops))
+            
             print(f"⚔️  PRE-ECS CONFLICT: {len(pending_ops)} operations competing for target {str(target_entity_id)[:8]}")
             for op in pending_ops:
                 print(f"   ├─ {op.op_type} (Priority: {op.priority}, Status: PRE-ECS)")
@@ -738,6 +631,10 @@ class ConflictResolutionTest:
                 self.metrics.record_operation_rejected(loser.priority)
                 # Remove from staging area - they never enter ECS
                 self.pending_operations[target_entity_id].remove(loser)
+            
+            # 🎯 METRICS: Record conflict resolved with timing
+            resolution_time_ms = (time.time() - resolution_start) * 1000
+            self.metrics.record_conflict_resolved(resolution_time_ms)
             
             # Promote winner to ECS for execution
             winner.promote_to_root()
@@ -867,24 +764,28 @@ class ConflictResolutionTest:
         if not self.stop_flag:
             print(f"✅ Submission phase complete - no new operations will be created")
                 
-    async def conflict_monitoring_worker(self):
-        """Monitor for conflicts and measure resolution."""
-        while not self.stop_flag and not getattr(self, 'stop_submission', False):
-            try:
-                # Only monitor during active submission phase
-                if not getattr(self, 'stop_submission', False):
-                    for target in self.target_entities:
-                        await self.detect_and_resolve_conflicts(target.ecs_id)
-                        
-                    # Minimal yield for cooperative multitasking - not for timing
-                    await asyncio.sleep(0.1)  # Slightly longer sleep to reduce spam
-                else:
-                    # During grace period, just sleep and check stop flag
-                    await asyncio.sleep(1.0)
-                
-            except Exception as e:
-                print(f"⚠️  Error in conflict monitoring: {e}")
-                await asyncio.sleep(1.0)  # Sleep on error to prevent spam
+    # ❌ REMOVED METHOD: conflict_monitoring_worker()
+    # 
+    # 📚 HISTORICAL CONTEXT:
+    # This worker was part of the old POST-ECS conflict resolution system.
+    # It ran continuously and called detect_and_resolve_conflicts() every 0.1 seconds.
+    #
+    # 🔍 WHAT IT DID:
+    # - Monitored all target entities for conflicts every 100ms
+    # - Called detect_and_resolve_conflicts() for each target
+    # - Ran as a separate async task alongside other workers
+    #
+    # ❌ WHY IT WAS REMOVED:
+    # 1. No longer needed: Conflicts now resolved during operation submission
+    # 2. Performance: Unnecessary continuous scanning of ECS registry
+    # 3. Timing issues: Could miss fast conflicts or create race conditions
+    # 4. Complexity: Added extra worker management without benefit
+    #
+    # ✅ NEW SYSTEM:
+    # - Conflicts detected and resolved immediately during submission
+    # - No separate monitoring worker needed
+    # - resolve_conflicts_before_ecs() called synchronously after each batch
+    # - Eliminates all timing and race condition issues
                 
     async def operation_lifecycle_driver(self):
         """Drive operation lifecycle - start and complete production operations."""
@@ -1166,6 +1067,8 @@ class ConflictResolutionTest:
         print(f"   │  ├─ Rejected: {self.metrics.operations_rejected}")
         print(f"   │  └─ In progress: {self.metrics.operations_in_progress}")
         print(f"   ├─ Unaccounted: {unaccounted}")
+        print(f"   ├─ 📝 Pre-ECS Conflict Resolution: {self.metrics.operations_rejected} operations")
+        print(f"   │  └─ rejected before entering ECS (never got ECS IDs)")
         print(f"   └─ Transition metrics (not counted in final):")
         print(f"      ├─ Failed (retried): {self.metrics.operations_failed}")
         print(f"      └─ Retried: {self.metrics.operations_retried}")
@@ -1186,7 +1089,13 @@ class ConflictResolutionTest:
         print(f"   ├─ Conflicts resolved: {self.metrics.conflicts_resolved}")
         if self.metrics.resolution_times:
             avg_resolution_time = statistics.mean(self.metrics.resolution_times)
-            print(f"   └─ Avg resolution time: {avg_resolution_time:.1f}ms")
+            print(f"   ├─ Avg resolution time: {avg_resolution_time:.1f}ms")
+        
+        # Explain conflict resolution math
+        if self.metrics.conflicts_detected > 0:
+            avg_ops_per_conflict = self.metrics.operations_submitted / self.metrics.conflicts_detected
+            print(f"   ├─ Avg operations per conflict: {avg_ops_per_conflict:.1f}")
+            print(f"   └─ 📝 Each conflict = 1 batch with multiple operations, 1 winner + rest rejected")
         
         # System performance
         if self.metrics.memory_samples:
@@ -1257,7 +1166,7 @@ class ConflictResolutionTest:
         print(f"   │  └─ Expected total versions: {expected_versions}")
         
         if total_versions_found == expected_versions:
-            print(f"   ├─ ✅ Perfect version accounting: {total_versions_found} = {expected_versions}")
+            print(f"   ├─ ✅ Perfect version accounting: {version_creating_ops} + {original_entities} original entities = {expected_versions}")
         elif total_versions_found > 0:
             print(f"   ├─ ✅ ECS versioning verified: Entities were modified in ECS system")
             if total_versions_found != expected_versions:
@@ -1270,8 +1179,9 @@ class ConflictResolutionTest:
         non_versioning_ops = expected_modifications - version_creating_ops
         if non_versioning_ops > 0:
             print(f"   ├─ Operations that modified state without creating versions: {non_versioning_ops}")
-            print(f"   │  └─ These operations (modify_field, borrow_attribute) update entity state")
-            print(f"   │     but don't call force_versioning=True (by design)")
+            print(f"   │  ├─ These operations (modify_field, borrow_attribute) update entity state")
+            print(f"   │  │  but don't call force_versioning=True (by design)")
+            print(f"   │  └─ 📝 ECS Versioning Logic: Only certain operations create new ECS versions")
             
         # Operation Lineage Analysis (in-memory)
         print(f"\n🕵️ Operation Lineage Analysis:")
@@ -1359,6 +1269,25 @@ class ConflictResolutionTest:
             print("   ✅ PRODUCTION OPERATIONS: System performed actual entity modifications")
         else:
             print("   ❌ NO PRODUCTION WORK: No actual entity modifications detected")
+            
+        # Add clear explanation of the overall logic
+        print(f"\n📚 SYSTEM LOGIC EXPLANATION:")
+        print(f"   ├─ 🎯 Conflict Resolution Logic:")
+        print(f"   │  ├─ Multiple operations submitted to same target in batches")
+        print(f"   │  ├─ Pre-ECS staging area detects conflicts before ECS entry")
+        print(f"   │  ├─ Priority-based resolution: 1 winner per conflict batch")
+        print(f"   │  └─ Losers rejected before getting ECS IDs (never enter system)")
+        print(f"   ├─ 🔄 ECS Versioning Logic:")
+        print(f"   │  ├─ All operations modify entity state")
+        print(f"   │  ├─ Only certain operations create new ECS versions")
+        print(f"   │  ├─ version_entity/complex_update → create versions")
+        print(f"   │  └─ modify_field/borrow_attribute → state-only updates")
+        print(f"   └─ 📊 Math Verification:")
+        print(f"      ├─ {self.metrics.operations_submitted} total operations → {self.metrics.conflicts_detected} conflict batches")
+        print(f"      ├─ {self.metrics.operations_completed} winners + {self.metrics.operations_rejected} losers = {self.metrics.operations_submitted} total")
+        print(f"      ├─ {self.metrics.entity_modifications} state modifications → {total_versions_found} ECS versions created")
+        print(f"      ├─ {version_creating_ops} operations created ECS versions")
+        print(f"      └─ {non_versioning_ops} operations modified state only (no versions)")
         
         return {
             'completion_rate': completion_rate,

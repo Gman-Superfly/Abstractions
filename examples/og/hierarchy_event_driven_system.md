@@ -2,7 +2,27 @@
 
 ## Overview
 
-The Hierarchy Event-Driven System is a **production-ready conflict resolution architecture** that combines Entity Component System (ECS) principles with pure event-driven programming to manage complex operation hierarchies, priority-based conflict resolution, and real-time system coordination. This system forms the backbone of our distributed entity management infrastructure.
+The Hierarchy Event-Driven System is a **production-ready conflict resolution architecture** that combines Entity Component System (ECS) principles with streamlined conflict resolution to manage complex operation hierarchies, priority-based conflict resolution, and real-time system coordination. This system forms the backbone of our distributed entity management infrastructure.
+
+## Architectural Evolution
+
+### Current Architecture: Pre-ECS Conflict Resolution
+
+The system has evolved from a **post-ECS event-driven model** to a **pre-ECS synchronous model** for improved performance and reliability:
+
+```
+OLD: Operation → ECS → Conflict Detection → Event Emission → Resolution → Cleanup
+NEW: Operation → Staging Area → Conflict Resolution → ECS Promotion (Winner Only)
+```
+
+**Key Benefits of New Architecture**:
+- **No Race Conditions**: Conflicts resolved before any ECS operations
+- **Cleaner Metrics**: No double-counting from multiple resolution systems
+- **Better Performance**: Synchronous resolution vs asynchronous event processing
+- **Simpler Debugging**: All conflict logic in one place
+- **No Cleanup Required**: Rejected operations never enter ECS
+
+**Legacy Support**: The original event-driven handlers remain available for backwards compatibility and other use cases, but are not used in the primary conflict resolution flow.
 
 ## Core Architecture Principles
 
@@ -72,13 +92,15 @@ class RealOperationEntity(OperationEntity):
 
 ## Event System Architecture
 
-### Core Event Types
+### Current Event Integration
+
+The system currently uses **minimal event integration** with the primary focus on ECS operation lifecycle rather than conflict resolution events:
 
 #### 1. Operation Lifecycle Events
 
 ```python
 class OperationStartedEvent(ProcessingEvent):
-    """Emitted when operation begins execution."""
+    """Emitted when operation begins execution (after ECS promotion)."""
     op_id: UUID
     op_type: str
     priority: OperationPriority
@@ -98,31 +120,41 @@ class OperationFailedEvent(ProcessingEvent):
     retry_count: int
 ```
 
-#### 2. Conflict Resolution Events
+#### 2. Pre-ECS Conflict Resolution (No Events)
+
+**Current Architecture**: Conflict resolution happens **before** ECS entry and is handled **synchronously** without event emission:
+
+```python
+async def resolve_conflicts_before_ecs(self, target_entity_id: UUID):
+    """Resolve conflicts in pre-ECS staging area before any ECS operations."""
+    pending_ops = self.pending_operations.get(target_entity_id, [])
+    
+    if len(pending_ops) > 1:
+        # Direct conflict resolution - no events needed
+        pending_ops.sort(key=lambda op: (op.priority, -op.created_at.timestamp()), reverse=True)
+        winner = pending_ops[0]
+        losers = pending_ops[1:]
+        
+        # Only winner gets promoted to ECS
+        winner.promote_to_root()
+        self.submitted_operations.add(winner.ecs_id)
+```
+
+#### 3. Legacy Event Types (Available but Not Used)
+
+The following event types exist for compatibility but are not actively used in the current pre-ECS architecture:
 
 ```python
 class OperationConflictEvent(ProcessingEvent):
-    """Emitted when multiple operations target same entity."""
-    op_id: UUID                    # Primary conflicting operation
-    target_entity_id: UUID         # Entity being contested
-    priority: OperationPriority    # Priority of primary operation
-    conflict_details: Dict[str, Any]  # Detailed conflict information
-    conflicting_op_ids: List[UUID]    # Other operations in conflict
+    """Legacy: Previously used for post-ECS conflict resolution."""
+    # Now handled synchronously in pre-ECS staging area
 
 class OperationRejectedEvent(ProcessingEvent):
-    """Emitted when operation is rejected due to conflict."""
-    op_id: UUID
-    rejection_reason: str
-    from_state: str
-    to_state: str
-    retry_count: int
-```
+    """Legacy: Previously used for event-driven rejections."""
+    # Now handled synchronously during conflict resolution
 
-#### 3. Retry and Recovery Events
-
-```python
 class OperationRetryEvent(ProcessingEvent):
-    """Emitted when operation is retried after failure."""
+    """Still used for operation retry scenarios."""
     op_id: UUID
     retry_count: int
     max_retries: int
@@ -130,14 +162,16 @@ class OperationRetryEvent(ProcessingEvent):
     retry_reason: str
 ```
 
-### Production Event Handlers
+### Current Event Handlers
 
-#### Conflict Resolution Handler
+#### Generic Event Handlers (Available but Not Used for Conflicts)
+
+The event system includes **generic event handlers** that remain available for other use cases:
 
 ```python
 @on(OperationConflictEvent)
 async def resolve_operation_conflict(event: OperationConflictEvent):
-    """Production handler for operation conflicts."""
+    """Generic handler - available but not used in current pre-ECS architecture."""
     try:
         from abstractions.ecs.functional_api import get
         from abstractions.ecs.entity_hierarchy import resolve_operation_conflicts, get_conflicting_operations
@@ -155,7 +189,8 @@ async def resolve_operation_conflict(event: OperationConflictEvent):
             # Resolve conflicts using the hierarchy system
             winning_ops = resolve_operation_conflicts(
                 event.target_entity_id,
-                [current_op] + conflicting_ops
+                [current_op] + conflicting_ops,
+                None  # Generic handler doesn't have access to grace tracker
             )
             
             # Emit rejection events for losing operations
@@ -170,32 +205,25 @@ async def resolve_operation_conflict(event: OperationConflictEvent):
                         rejection_reason="preempted_by_higher_priority",
                         retry_count=op.retry_count
                     ))
+            
+            logger.info(f"Resolved conflict for operation {event.op_id} on entity {event.target_entity_id}")
     except Exception as e:
         logger.error(f"Error in conflict resolution handler: {e}", exc_info=True)
 ```
 
-#### Operation Rejection Handler
+**Note**: This handler remains available for backwards compatibility but is not used in the current pre-ECS conflict resolution architecture.
+
+#### Legacy Operation Rejection Handler
 
 ```python
 @on(OperationRejectedEvent)
 async def handle_operation_rejection(event: OperationRejectedEvent):
-    """Production handler for operation rejections."""
+    """Generic handler for operation rejections."""
     try:
         logger.info(
             f"Operation {event.op_type} (ID: {event.op_id}) rejected: {event.rejection_reason}. "
             f"Retry count: {event.retry_count}"
         )
-        
-        # Update parent operations in hierarchy if applicable
-        try:
-            from abstractions.ecs.functional_api import get
-            op = get(f"@{event.op_id}")
-            if op and hasattr(op, 'parent_op_id') and op.parent_op_id:
-                parent_op = get(f"@{op.parent_op_id}")
-                if parent_op:
-                    logger.debug(f"Child operation {event.op_id} rejected under parent {op.parent_op_id}")
-        except Exception as e:
-            logger.debug(f"Could not update parent operation: {e}")
             
     except Exception as e:
         logger.error(f"Error in rejection handler: {e}", exc_info=True)
@@ -203,9 +231,65 @@ async def handle_operation_rejection(event: OperationRejectedEvent):
 
 ## Conflict Resolution Algorithm
 
-### Priority-Based Resolution
+### Pre-ECS Priority-Based Resolution
 
-The system implements **strict priority-based conflict resolution**:
+The system implements **pre-ECS conflict resolution** that prevents conflicts from reaching the ECS:
+
+```python
+async def resolve_conflicts_before_ecs(self, target_entity_id: UUID):
+    """
+    Resolve conflicts in pre-ECS staging area before any ECS operations.
+    
+    Resolution Rules:
+    1. Operations accumulate in staging area (not yet in ECS)
+    2. Conflicts resolved by priority (higher number wins)
+    3. Tiebreaker: earlier timestamp wins
+    4. Only winner gets promoted to ECS via promote_to_root()
+    5. Losers never enter ECS (no cleanup needed)
+    """
+    pending_ops = self.pending_operations.get(target_entity_id, [])
+    
+    if len(pending_ops) > 1:
+        # Track resolution timing
+        resolution_start = time.time()
+        
+        # Record conflict detection
+        self.metrics.record_conflict_detected(len(pending_ops))
+        
+        # Sort by priority (higher priority = higher number wins)
+        # Secondary sort by timestamp (earlier wins)
+        pending_ops.sort(key=lambda op: (op.priority, -op.created_at.timestamp()), reverse=True)
+        
+        # Winner is highest priority (first after sort)
+        winner = pending_ops[0]
+        losers = pending_ops[1:]
+        
+        # Reject losers before they enter ECS
+        for loser in losers:
+            self.metrics.record_operation_rejected(loser.priority)
+            # Remove from staging area - they never enter ECS
+            self.pending_operations[target_entity_id].remove(loser)
+        
+        # Record conflict resolution timing
+        resolution_time_ms = (time.time() - resolution_start) * 1000
+        self.metrics.record_conflict_resolved(resolution_time_ms)
+        
+        # Promote winner to ECS for execution
+        winner.promote_to_root()
+        self.submitted_operations.add(winner.ecs_id)
+        self.pending_operations[target_entity_id] = []  # Clear staging area
+        
+    elif len(pending_ops) == 1:
+        # No conflict - promote single operation to ECS
+        winner = pending_ops[0]
+        winner.promote_to_root()
+        self.submitted_operations.add(winner.ecs_id)
+        self.pending_operations[target_entity_id] = []
+```
+
+### Legacy Post-ECS Resolution (Available but Not Used)
+
+The original post-ECS conflict resolution remains available for backwards compatibility:
 
 ```python
 def resolve_operation_conflicts(
@@ -214,57 +298,11 @@ def resolve_operation_conflicts(
     grace_tracker: Optional[GracePeriodTracker] = None
 ) -> List[OperationEntity]:
     """
-    Resolve conflicts using priority hierarchy and protection rules.
-    
-    Resolution Rules:
-    1. EXECUTING operations are always protected (cannot be preempted)
-    2. Operations in grace period are protected from preemption
-    3. Among PENDING operations, highest priority wins
-    4. Child operations inherit parent priority if higher
-    5. Equal priority operations use timestamp tiebreaker
+    Legacy: Post-ECS conflict resolution (not used in current architecture).
+    Available for backwards compatibility and other use cases.
     """
-    
-    # Separate operations by status
-    executing_ops = [op for op in operations if op.status == OperationStatus.EXECUTING]
-    pending_ops = [op for op in operations if op.status == OperationStatus.PENDING]
-    
-    winners = []
-    
-    # Rule 1: All EXECUTING operations are protected
-    for op in executing_ops:
-        if grace_tracker and not grace_tracker.can_be_preempted(op.ecs_id):
-            winners.append(op)  # Grace period protection
-        else:
-            winners.append(op)  # Execution protection
-    
-    # Rule 2: Among PENDING operations, select highest priority
-    if pending_ops:
-        # Get effective priorities (including inheritance)
-        priority_groups = {}
-        for op in pending_ops:
-            effective_priority = op.get_effective_priority()
-            if effective_priority not in priority_groups:
-                priority_groups[effective_priority] = []
-            priority_groups[effective_priority].append(op)
-        
-        # Select highest priority group
-        highest_priority = max(priority_groups.keys())
-        highest_priority_ops = priority_groups[highest_priority]
-        
-        if len(highest_priority_ops) == 1:
-            winners.extend(highest_priority_ops)
-        else:
-            # Tiebreaker: earliest submission time
-            earliest_op = min(highest_priority_ops, key=lambda op: op.created_at)
-            winners.append(earliest_op)
-    
-    # Rule 3: Reject all non-winning operations
-    for op in operations:
-        if op not in winners and op.status == OperationStatus.PENDING:
-            op.status = OperationStatus.REJECTED
-            op.error_message = "Preempted by higher priority operation"
-    
-    return winners
+    # Implementation remains available but is not used in pre-ECS system
+    # ... (original implementation)
 ```
 
 ### Grace Period Protection
@@ -520,8 +558,7 @@ The system uses **multiple async workers** for maximum concurrency:
 async def run_hierarchy_system(self):
     """Run the complete hierarchy event-driven system."""
     tasks = [
-        asyncio.create_task(self.operation_submission_worker()),    # Submit operations
-        asyncio.create_task(self.conflict_monitoring_worker()),     # Monitor conflicts  
+        asyncio.create_task(self.operation_submission_worker()),    # Submit operations + resolve conflicts
         asyncio.create_task(self.operation_lifecycle_driver()),     # Drive execution
         asyncio.create_task(self.operation_lifecycle_observer()),   # Observe state
         asyncio.create_task(self.metrics_collector()),             # Collect metrics
@@ -535,6 +572,8 @@ async def run_hierarchy_system(self):
         for task in tasks:
             task.cancel()
 ```
+
+**Note**: The `conflict_monitoring_worker` has been removed as conflicts are now resolved synchronously during operation submission.
 
 ### Batch Conflict Processing
 

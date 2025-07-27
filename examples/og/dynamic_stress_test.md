@@ -206,58 +206,72 @@ Operations within each batch have **mixed priorities** to test conflict resoluti
 - **HIGH (8)**: Important operations, high priority
 - **CRITICAL (10)**: System operations, highest priority
 
-## Real-Time Conflict Detection
+## Pre-ECS Conflict Resolution
 
-### Operation State Tracking
+### Staging Area Architecture
 
-The system provides **real-time visibility** into operation states:
+The system uses a **pre-ECS staging area** to prevent conflicts from reaching the ECS:
 
 ```python
-🔍 TARGET STATUS: Target 4170f0d6 has 6 total operations
-   ├─ PENDING: 6      ← Multiple operations waiting
-   ├─ EXECUTING: 0
-   └─ COMPLETED: 0
-   🔥 ACTIVE OPERATIONS:
-      ├─ version_entity_1 (ID: 32c1eb89) - Status: OperationStatus.PENDING, Priority: 2
-      ├─ borrow_attribute_2 (ID: 7d0008a2) - Status: OperationStatus.PENDING, Priority: 5
-      ├─ version_entity_3 (ID: 2bace7b7) - Status: OperationStatus.PENDING, Priority: 8
-      ├─ version_entity_4 (ID: 321f9bc3) - Status: OperationStatus.PENDING, Priority: 10
+class ConflictResolutionTest:
+    def __init__(self, config: TestConfig):
+        # Pre-ECS staging area holds operations before ECS entry
+        self.pending_operations: Dict[UUID, List[RealOperationEntity]] = {}
+        self.submitted_operations: Set[UUID] = set()  # Only ECS operations
 ```
 
-This proves that **multiple operations are simultaneously pending** on the same target entity.
+### Operation Flow
+
+```
+1. Operations created → Pre-ECS staging area
+2. Batch accumulation → Multiple operations per target
+3. Conflict resolution → Priority-based winner selection  
+4. ECS promotion → Only winners get ECS IDs via promote_to_root()
+5. Execution → Standard ECS operation lifecycle
+```
 
 ### Conflict Resolution Process
 
-#### Step 1: Conflict Detection
+#### Step 1: Batch Accumulation
 
 ```python
-conflicts = get_conflicting_operations(target_entity_id)
-# Finds all PENDING/EXECUTING operations targeting the same entity
+🔥 BRUTAL BATCH: Submitting 6 operations to target 4170f0d6 simultaneously
+   ├─ version_entity (Priority: 2) → Target: 4170f0d6
+   ├─ borrow_attribute (Priority: 5) → Target: 4170f0d6
+   ├─ version_entity (Priority: 8) → Target: 4170f0d6
+   ├─ version_entity (Priority: 10) → Target: 4170f0d6
+   ├─ modify_field (Priority: 2) → Target: 4170f0d6
+   ├─ borrow_attribute (Priority: 5) → Target: 4170f0d6
+🎯 BATCH COMPLETE: 6 operations submitted to same target
 ```
 
-#### Step 2: Priority-Based Resolution
+#### Step 2: Pre-ECS Conflict Detection
 
 ```python
-⚔️  CONFLICT DETECTED: 6 operations competing for target 4170f0d6
-   ├─ version_entity_1 (Priority: 2, Status: PENDING)    ← Will be rejected
-   ├─ borrow_attribute_2 (Priority: 5, Status: PENDING)  ← Will be rejected
-   ├─ version_entity_3 (Priority: 8, Status: PENDING)    ← Will be rejected
-   ├─ version_entity_4 (Priority: 10, Status: PENDING)   ← WINNER (highest priority)
-   ├─ modify_field_5 (Priority: 2, Status: PENDING)      ← Will be rejected
-   ├─ borrow_attribute_6 (Priority: 5, Status: PENDING)  ← Will be rejected
+🔍 STAGING CHECK: Target 4170f0d6 has 6 pending operations
+⚔️  PRE-ECS CONFLICT: 6 operations competing for target 4170f0d6
+   ├─ version_entity (Priority: 2, Status: PRE-ECS)
+   ├─ borrow_attribute (Priority: 5, Status: PRE-ECS)  
+   ├─ version_entity (Priority: 8, Status: PRE-ECS)
+   ├─ version_entity (Priority: 10, Status: PRE-ECS)   ← WINNER
+   ├─ modify_field (Priority: 2, Status: PRE-ECS)
+   ├─ borrow_attribute (Priority: 5, Status: PRE-ECS)
 ```
 
-#### Step 3: Winner Selection and Execution
+#### Step 3: Priority-Based Resolution (Before ECS)
 
 ```python
-🏆 RESOLUTION: 1 winner(s), 5 rejected
-❌ REJECTED: version_entity_1 (ID: a04bb145) - Priority: 2
-❌ REJECTED: borrow_attribute_2 (ID: 8142e317) - Priority: 5
-❌ REJECTED: version_entity_3 (ID: 6fe21ba8) - Priority: 8
-❌ REJECTED: modify_field_5 (ID: 0d458950) - Priority: 2
-❌ REJECTED: borrow_attribute_6 (ID: 1f4dec39) - Priority: 5
-🚀 OPERATION: Started version_entity_4 (Priority: 10) ← Winner executes
+🏆 PRE-ECS RESOLUTION: 1 winner, 5 rejected
+✅ WINNER: version_entity (Priority: 10)
+❌ REJECTED: version_entity (Priority: 2)
+❌ REJECTED: borrow_attribute (Priority: 5)
+❌ REJECTED: version_entity (Priority: 8)
+❌ REJECTED: modify_field (Priority: 2)
+❌ REJECTED: borrow_attribute (Priority: 5)
+🚀 PROMOTED TO ECS: version_entity (ID: 4a7b9c2d)
 ```
+
+**Key Advantage**: Rejected operations **never enter the ECS** - they never get ECS IDs, never appear in the registry, and require no cleanup.
 
 ## Grace Period Protection
 
@@ -287,12 +301,12 @@ class GracePeriodTracker:
 
 ## Event System Integration
 
-### Operation Lifecycle Events
+### Simplified Event Architecture
 
-The test integrates with our event system to emit operation lifecycle events:
+The current system uses **minimal event integration** focused on the ECS operation lifecycle:
 
 ```python
-# Operation Started
+# Operation Started (after ECS promotion)
 await emit(OperationStartedEvent(
     process_name="conflict_resolution_test",
     op_id=operation.ecs_id,
@@ -309,33 +323,9 @@ await emit(OperationCompletedEvent(
     target_entity_id=operation.target_entity_id,
     execution_duration_ms=execution_time * 1000
 ))
-
-# Conflict Detected
-await emit(OperationConflictEvent(
-    process_name="conflict_resolution_test",
-    op_id=conflicts[0].ecs_id,
-    op_type=conflicts[0].op_type,
-    target_entity_id=target_entity_id,
-    priority=conflicts[0].priority,
-    conflict_details={
-        "total_conflicts": len(conflicts),
-        "conflict_priorities": [op.priority for op in conflicts],
-        "conflict_operation_types": [op.operation_type for op in conflicts]
-    },
-    conflicting_op_ids=[op.ecs_id for op in conflicts[1:]]
-))
-
-# Operation Rejected
-await emit(OperationRejectedEvent(
-    op_id=loser.ecs_id,
-    op_type=loser.op_type,
-    target_entity_id=loser.target_entity_id,
-    from_state="pending",
-    to_state="rejected",
-    rejection_reason="preempted_by_higher_priority",
-    retry_count=loser.retry_count
-))
 ```
+
+**Note**: Conflict resolution now happens **before** ECS entry, so conflict events are handled internally rather than through the event system.
 
 ### Agent Observer Integration
 
@@ -375,40 +365,44 @@ class ConflictResolutionMetrics:
 
 ```
 🔧 PRODUCTION Operation Results:
-   ├─ Total entity modifications: 747
-   ├─ Versioning operations: 236
-   ├─ Borrowing operations: 150
-   ├─ Structural operations: 77
-   ├─ Avg production operation time: 3.0ms
+   ├─ Total entity modifications: 305
+   ├─ Versioning operations: 98
+   ├─ Borrowing operations: 38
+   ├─ Structural operations: 22
+   ├─ Avg production operation time: 1.1ms
    └─ Production operations by type:
-       ├─ version_entity: 236 total, 236 successful (100.0%)
-       ├─ modify_field: 164 total, 164 successful (100.0%)
-       ├─ complex_update: 120 total, 120 successful (100.0%)
-       ├─ borrow_attribute: 150 total, 150 successful (100.0%)
-       ├─ promote_to_root: 34 total, 34 successful (100.0%)
-       ├─ detach_entity: 43 total, 43 successful (100.0%)
+       ├─ version_entity: 98 total, 98 successful (100.0%)
+       ├─ modify_field: 89 total, 89 successful (100.0%)
+       ├─ complex_update: 55 total, 55 successful (100.0%)
+       ├─ borrow_attribute: 38 total, 38 successful (100.0%)
+       ├─ promote_to_root: 15 total, 15 successful (100.0%)
+       ├─ detach_entity: 10 total, 10 successful (100.0%)
 
 🔍 ECS Lineage and Versioning Analysis:
-   ├─ Expected modifications (from metrics): 747
-   ├─ Actual ECS versions found: 361
+   ├─ Total operations that modified entities: 305
+   ├─ Actual ECS versions found: 158
    ├─ Version accounting breakdown:
-   │  ├─ Operations that create versions: 356
-   │  │  ├─ version_entity operations: 236
-   │  │  └─ complex_update operations: 120
+   │  ├─ Operations that create versions: 153
+   │  │  ├─ version_entity operations: 98
+   │  │  └─ complex_update operations: 55
    │  ├─ Original target entities: 5
-   │  └─ Expected total versions: 361
-   ├─ ✅ Perfect version accounting: 361 = 361
-   ├─ Operations that succeeded without creating versions: 391
-   │  └─ These modify entity state but don't call force_versioning=True
+   │  └─ Expected total versions: 158
+   ├─ ✅ Perfect version accounting: 158 = 158
+   ├─ Operations that modified state without creating versions: 152
+   │  ├─ These operations (modify_field, borrow_attribute) update entity state
+   │  │  but don't call force_versioning=True (by design)
+   │  └─ 📝 ECS Versioning Logic: Only certain operations create new ECS versions
 ```
 
 ### Conflict Resolution Metrics
 
 ```
 ⚔️  Conflict Resolution Results:
-   ├─ Conflicts detected: 18
-   ├─ Conflicts resolved: 18
-   └─ Avg resolution time: 7.2ms
+   ├─ Conflicts detected: 305
+   ├─ Conflicts resolved: 305
+   ├─ Avg resolution time: 1.1ms
+   ├─ Avg operations per conflict: 5.7
+   └─ 📝 Each conflict = 1 batch with multiple operations, 1 winner + rest rejected
 ```
 
 ### System Performance Metrics
@@ -524,8 +518,7 @@ The test uses **multiple async workers** for maximum concurrency:
 async def run_test(self):
     """Run the complete conflict resolution test."""
     tasks = [
-        asyncio.create_task(self.operation_submission_worker()),    # Submit operations
-        asyncio.create_task(self.conflict_monitoring_worker()),     # Monitor conflicts
+        asyncio.create_task(self.operation_submission_worker()),    # Submit operations + resolve conflicts
         asyncio.create_task(self.operation_lifecycle_driver()),     # Drive execution
         asyncio.create_task(self.operation_lifecycle_observer()),   # Observe lifecycle
         asyncio.create_task(self.metrics_collector()),             # Collect metrics
@@ -535,12 +528,13 @@ async def run_test(self):
 
 ### Worker Responsibilities
 
-1. **Operation Submission Worker**: Creates batches of conflicting operations
-2. **Conflict Monitoring Worker**: Detects and resolves conflicts in real-time
-3. **Operation Lifecycle Driver**: Starts and completes operations
-4. **Operation Lifecycle Observer**: Validates entity modifications
-5. **Metrics Collector**: Gathers system performance data
-6. **Progress Reporter**: Provides real-time status updates
+1. **Operation Submission Worker**: Creates batches + resolves conflicts before ECS entry
+2. **Operation Lifecycle Driver**: Starts and completes ECS operations
+3. **Operation Lifecycle Observer**: Validates entity modifications
+4. **Metrics Collector**: Gathers system performance data
+5. **Progress Reporter**: Provides real-time status updates
+
+**Note**: The old `conflict_monitoring_worker` has been removed as conflicts are now resolved synchronously during submission.
 
 ## No Fake Data Guarantee
 
