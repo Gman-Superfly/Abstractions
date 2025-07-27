@@ -1525,6 +1525,14 @@ class Entity(BaseModel):
         description="Tracks the source entity for each attribute"
     )
     
+    # OCC = Optimistic Concurrency Control - prevents race conditions during entity modifications
+    # OCC allows multiple operations to read/modify entities concurrently, detecting conflicts before commit
+    version: int = Field(default=0, description="OCC monotonic version counter - incremented on every modification")
+    last_modified: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="OCC timestamp of last modification - used with version counter for conflict detection"
+    )
+    
     # Phase 4 sibling relationship tracking fields
     derived_from_function: Optional[str] = Field(default=None, description="Function that created or modified this entity")
     derived_from_execution_id: Optional[UUID] = Field(default=None, description="Execution ID that created or modified this entity")
@@ -1644,6 +1652,36 @@ class Entity(BaseModel):
         return self.root_ecs_id is None or self.root_live_id is None
         
     
+    def mark_modified(self) -> None:
+        """
+        Mark entity as modified for OCC (Optimistic Concurrency Control).
+        
+        Updates the OCC fields when entity data is modified but not versioned/forked.
+        This provides conflict detection for concurrent modifications without creating new entity versions.
+        
+        OCC = Optimistic Concurrency Control - allows concurrent access while detecting conflicts before commit.
+        """
+        self.version += 1
+        self.last_modified = datetime.now(timezone.utc)
+    
+    def has_occ_conflict(self, other: "Entity") -> bool:
+        """
+        Check if this entity has an OCC (Optimistic Concurrency Control) conflict with another entity.
+        
+        Returns True if the other entity has been modified since this entity's last known state.
+        Used to detect concurrent modifications before committing changes.
+        
+        Args:
+            other: The current version of the entity to compare against
+            
+        Returns:
+            True if there's a conflict (other entity was modified), False otherwise
+            
+        OCC = Optimistic Concurrency Control - prevents lost updates in concurrent scenarios.
+        """
+        return (self.version != other.version or 
+                self.last_modified != other.last_modified)
+    
     def update_ecs_ids(self, new_root_ecs_id: Optional[UUID] = None, root_entity_live_id: Optional[UUID] = None) -> None:
         """
         Assign new ecs_id 
@@ -1652,6 +1690,8 @@ class Entity(BaseModel):
         Adds the previous ecs_id to old_ids
         If new_root_ecs_id is provided, updates root_ecs_id to the new value
         If root_entity_live_id is provided, updates root_live_id to the new value this requires new_root_ecs_id to be provided
+        
+        Also updates OCC fields since versioning/forking is a type of modification.
         """
         old_ecs_id = self.ecs_id
         new_ecs_id = uuid4()
@@ -1660,6 +1700,12 @@ class Entity(BaseModel):
         self.forked_at = datetime.now(timezone.utc)
         self.old_ecs_id = old_ecs_id
         self.old_ids.append(old_ecs_id)
+        
+        # Update OCC fields for versioning/forking operations
+        # OCC = Optimistic Concurrency Control - track modification for conflict detection
+        self.version += 1
+        self.last_modified = datetime.now(timezone.utc)
+        
         if new_root_ecs_id:
             self.root_ecs_id = new_root_ecs_id
         if root_entity_live_id and not new_root_ecs_id:
@@ -1923,6 +1969,10 @@ class Entity(BaseModel):
         else:
             # For simple fields and entities, point to source entity
             self.attribute_source[self_field] = source_entity.ecs_id
+        
+        # Step 6: Mark entity as modified for OCC (Optimistic Concurrency Control)
+        # OCC = prevents race conditions when multiple operations modify the same entity
+        self.mark_modified()
 
 
 
