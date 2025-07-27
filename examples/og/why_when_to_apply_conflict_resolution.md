@@ -19,25 +19,25 @@ The Abstractions framework is built on principles that eliminate common concurre
 original = Student(name="Alice", gpa=3.5)
 original.promote_to_root()
 
-# Transformations create new versions
+# Transformations modify entities through registered functions
 @CallableRegistry.register("update_gpa")
 def update_gpa(student: Student, new_gpa: float) -> Student:
-    student.gpa = new_gpa  # Creates new version
+    student.gpa = new_gpa  # Direct field modification
     return student
 
 updated = CallableRegistry.execute("update_gpa", student=original, new_gpa=3.8)
 
-# Both versions coexist - no conflicts possible
-assert original.gpa == 3.5  # Original unchanged
-assert updated.gpa == 3.8   # New version created
+# Entity has been modified in-place through the callable registry
+assert updated.gpa == 3.8   # Entity field updated
+assert updated is original  # Same entity object (unless explicitly copied)
 assert original.lineage_id == updated.lineage_id  # Same lineage
 ```
 
-**Why this is conflict-free:**
-- **Immutable entities**: Original data never changes
-- **Versioned transformations**: Each operation creates new entities
+**Why this is generally conflict-free:**
+- **Structured modifications**: Changes go through registered callable functions
+- **Entity lifecycle management**: ECS versioning available when needed
 - **Provenance tracking**: Complete audit trail automatically maintained
-- **Isolated execution**: Functions operate on independent data copies
+- **Functional design**: Operations designed as pure transformations where possible
 
 ### String Addressing is Read-Only
 
@@ -372,12 +372,152 @@ def assign_priorities(tasks: List[Task]) -> List[Task]:
 
 ## Implementation Patterns
 
-### Pattern 1: Decorator-Based Opt-In
+### Pattern 1: Manual Implementation (Full Control)
+
+For cases requiring custom logic or integration with existing systems, implement conflict resolution manually using the validated patterns from the stress tests:
 
 ```python
+from abstractions.ecs.entity_hierarchy import (
+    OperationEntity, OperationStatus, OperationPriority,
+    resolve_operation_conflicts
+)
+from abstractions.events.events import emit, OperationConflictEvent, OperationRejectedEvent
+
+# Manual Pre-ECS conflict resolution
+class CustomOperationEntity(OperationEntity):
+    """Custom operation with manual conflict resolution."""
+    
+    operation_type: str = "custom_operation"
+    operation_data: Dict[str, Any] = {}
+    
+    async def execute_with_manual_occ(self, target: Entity) -> bool:
+        """Manual OCC implementation with custom retry logic."""
+        retry_count = 0
+        max_retries = 10
+        
+        while retry_count <= max_retries:
+            # READ: Snapshot current state
+            read_version = target.version
+            read_modified = target.last_modified
+            
+            # PROCESS: Your custom processing logic
+            await asyncio.sleep(0.005)  # Simulate work
+            new_value = self.compute_new_value(target.data)
+            
+            # WRITE: Check for conflicts before committing
+            if (target.version != read_version or 
+                target.last_modified != read_modified):
+                
+                # Emit conflict event
+                await emit(OperationConflictEvent(
+                    op_id=self.ecs_id,
+                    op_type=self.op_type,
+                    target_entity_id=target.ecs_id,
+                    priority=self.priority,
+                    conflict_details={"retry_count": retry_count}
+                ))
+                
+                retry_count += 1
+                await asyncio.sleep(0.002 * (2 ** retry_count))  # Exponential backoff
+                continue
+            
+            # COMMIT: Safe to write
+            target.data = new_value
+            target.mark_modified()
+            return True
+        
+        return False
+
+# Manual Pre-ECS staging area management
+class ConflictManager:
+    """Manual conflict resolution manager."""
+    
+    def __init__(self):
+        self.pending_operations: Dict[UUID, List[OperationEntity]] = {}
+    
+    async def submit_operation(self, operation: OperationEntity, target_id: UUID):
+        """Submit operation to staging area."""
+        if target_id not in self.pending_operations:
+            self.pending_operations[target_id] = []
+        
+        self.pending_operations[target_id].append(operation)
+        # Don't promote_to_root() yet - keep in staging
+    
+    async def resolve_conflicts_for_target(self, target_id: UUID):
+        """Resolve conflicts using existing conflict resolution system."""
+        pending_ops = self.pending_operations.get(target_id, [])
+        
+        if len(pending_ops) > 1:
+            print(f"⚔️  CONFLICT: {len(pending_ops)} operations for target {target_id}")
+            
+            # Use existing conflict resolution system
+            winners = resolve_operation_conflicts(target_id, pending_ops)
+            
+            # Promote winners to ECS
+            for winner in winners:
+                winner.promote_to_root()
+            
+            # Emit rejection events for losers
+            for op in pending_ops:
+                if op not in winners:
+                    await emit(OperationRejectedEvent(
+                        op_id=op.ecs_id,
+                        op_type=op.op_type,
+                        target_entity_id=target_id,
+                        from_state="pending",
+                        to_state="rejected",
+                        rejection_reason="preempted_by_higher_priority",
+                        retry_count=op.retry_count
+                    ))
+            
+            self.pending_operations[target_id] = []
+            return winners
+        
+        elif len(pending_ops) == 1:
+            # No conflict - promote single operation
+            winner = pending_ops[0]
+            winner.promote_to_root()
+            self.pending_operations[target_id] = []
+            return [winner]
+        
+        return []
+
+# Manual usage pattern
+async def manual_conflict_resolution_example():
+    """Example of manual conflict resolution implementation."""
+    manager = ConflictManager()
+    target_entity = MyEntity(data="initial")
+    
+    # Create competing operations
+    ops = []
+    for i in range(5):
+        op = CustomOperationEntity(
+            op_type=f"operation_{i}",
+            priority=random.choice([2, 5, 8, 10]),
+            target_entity_id=target_entity.ecs_id,
+            operation_data={"value": i}
+        )
+        ops.append(op)
+        await manager.submit_operation(op, target_entity.ecs_id)
+    
+    # Resolve conflicts manually
+    winners = await manager.resolve_conflicts_for_target(target_entity.ecs_id)
+    
+    # Execute winners with OCC protection
+    for winner in winners:
+        success = await winner.execute_with_manual_occ(target_entity)
+        print(f"Operation {winner.op_type} {'succeeded' if success else 'failed'}")
+```
+
+### Pattern 2: Decorator-Based Opt-In
+
+```python
+from abstractions.ecs.conflict_decorators import with_conflict_resolution, no_conflict_resolution
+from abstractions.ecs.entity_hierarchy import OperationPriority
+
 # Explicit conflict resolution for specific operations
 @CallableRegistry.register("process_student_cohort")
-@with_conflict_resolution(pre_ecs=True, occ=True, priority="high")
+@with_conflict_resolution(pre_ecs=True, occ=True, priority=OperationPriority.HIGH)
 def process_student_cohort(cohort: List[Student]) -> List[AnalysisResult]:
     # Two-stage protection applied automatically
     pass
@@ -385,7 +525,7 @@ def process_student_cohort(cohort: List[Student]) -> List[AnalysisResult]:
 # Normal operations use standard framework behavior
 @CallableRegistry.register("update_individual_student")  
 def update_individual_student(student: Student, new_data: Dict) -> Student:
-    # No conflict resolution needed - immutable by design
+    # No conflict resolution needed - functional design handles this
     pass
 ```
 
@@ -406,17 +546,100 @@ def read_only_batch_analysis(students: List[Student]) -> Statistics:
     pass
 ```
 
-### Pattern 3: Execution Context Detection
+### Pattern 3: Hybrid Approach
+
+Combine manual and declarative patterns for maximum flexibility:
 
 ```python
-# Framework detects concurrent execution patterns
-async def run_batch_processing():
-    # Automatic conflict detection when same collection used concurrently
-    results = await asyncio.gather(*[
-        CallableRegistry.aexecute("normalize_grades", cohort=students),    # Auto-protected
-        CallableRegistry.aexecute("calculate_statistics", cohort=students), # Auto-protected
-        CallableRegistry.aexecute("generate_reports", cohort=students)      # Auto-protected
-    ])
+# Use decorators for standard cases
+@with_conflict_resolution(pre_ecs=True, occ=True)
+def standard_batch_operation(entities: List[Entity]) -> List[Result]:
+    # Standard two-stage protection
+    pass
+
+# Use manual implementation for complex custom logic
+class AdvancedConflictManager(ConflictManager):
+    """Extended manager with custom conflict resolution logic."""
+    
+    async def resolve_conflicts_with_custom_logic(self, target_id: UUID):
+        """Custom conflict resolution with business logic."""
+        pending_ops = self.pending_operations.get(target_id, [])
+        
+        if len(pending_ops) > 1:
+            # Custom resolution logic based on operation types
+            critical_ops = [op for op in pending_ops if op.priority >= 10]
+            if critical_ops:
+                # Critical operations always win
+                winners = critical_ops[:1]  # Take first critical op
+            else:
+                # Use standard resolution for non-critical
+                winners = resolve_operation_conflicts(target_id, pending_ops)
+            
+            # Custom logging and metrics
+            self.log_conflict_resolution(target_id, pending_ops, winners)
+            
+            return winners
+        
+        return pending_ops
+
+# Integration with existing CallableRegistry
+@CallableRegistry.register("complex_analysis")
+async def complex_analysis_with_manual_conflict_resolution(
+    entities: List[Entity], 
+    analysis_type: str
+) -> AnalysisResult:
+    """Function that uses manual conflict resolution for specific scenarios."""
+    
+    if analysis_type == "high_contention":
+        # Use manual conflict resolution for high-contention scenarios
+        manager = AdvancedConflictManager()
+        
+        # Create operation with custom priority logic
+        priority = OperationPriority.CRITICAL if len(entities) > 100 else OperationPriority.NORMAL
+        operation = CustomOperationEntity(
+            op_type="complex_analysis",
+            priority=priority,
+            target_entity_id=entities[0].ecs_id,
+            operation_data={"analysis_type": analysis_type, "entity_count": len(entities)}
+        )
+        
+        # Manual staging and conflict resolution
+        await manager.submit_operation(operation, entities[0].ecs_id)
+        winners = await manager.resolve_conflicts_with_custom_logic(entities[0].ecs_id)
+        
+        if operation in winners:
+            # Execute the actual analysis
+            return perform_complex_analysis(entities, analysis_type)
+        else:
+            raise RuntimeError("Operation rejected by conflict resolution")
+    else:
+        # Standard execution for low-contention scenarios
+        return perform_complex_analysis(entities, analysis_type)
+```
+
+### Pattern 4: Advanced Configuration
+
+```python
+from abstractions.ecs.conflict_decorators import (
+    ConflictResolutionConfig, ConflictResolutionMode, 
+    PreECSConfig, OCCConfig
+)
+
+# Custom configuration for complex operations
+@with_conflict_resolution(config=ConflictResolutionConfig(
+    mode=ConflictResolutionMode.BOTH,
+    pre_ecs=PreECSConfig(
+        priority=OperationPriority.CRITICAL,
+        staging_timeout_ms=150.0
+    ),
+    occ=OCCConfig(
+        max_retries=15,
+        backoff_factor=2.0
+    )
+))
+async def optimize_schedules(students: List[Student]) -> List[Schedule]:
+    # Custom two-stage protection with tuned parameters
+    pass
 ```
 
 ## Performance Considerations
@@ -439,7 +662,7 @@ Two-stage protection adds minimal overhead only where needed:
 
 ## Conclusion
 
-The Abstractions framework's **entity-native functional design** naturally prevents 95%+ of concurrency issues through:
+The Abstractions framework's **entity-native functional design** naturally prevents concurrency issues through:
 - **Immutable entities** that cannot be corrupted by concurrent access
 - **Versioned transformations** that preserve complete history
 - **Pure functional operations** that operate on independent data copies
