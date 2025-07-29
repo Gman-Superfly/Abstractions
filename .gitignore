@@ -14,3 +14,10 @@ abstractions/text/chat/conversation_graph
 /.venv
 /.venv_wsl
 .env
+
+
+rules.txt
+datamutant_rules.md
+datamutant_coding_style.md
+impala.html
+gspo.md
