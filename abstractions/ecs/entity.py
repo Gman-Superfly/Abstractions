@@ -12,6 +12,7 @@ from typing import Dict, List, Set, Tuple, Any, Optional, Type, Union, get_type_
 from uuid import UUID, uuid4
 from enum import Enum
 from collections import deque
+from dataclasses import dataclass
 import inspect
 from pydantic import create_model
 
@@ -266,6 +267,120 @@ class EntityTree(BaseModel):
 
 
 # Functions to build the entity tree
+
+# ============================================================================
+# Field Metadata Caching for Performance
+# ============================================================================
+
+@dataclass
+class FieldMetadata:
+    """Cached metadata for an entity field to avoid repeated type introspection."""
+    name: str
+    contains_entities: bool
+    entity_type: Optional[Type["Entity"]]
+    container_type: Optional[str]  # 'list', 'dict', 'tuple', 'set', or None
+    is_identity_field: bool
+
+
+# Global cache: maps entity class to its field metadata
+_FIELD_METADATA_CACHE: Dict[Type["Entity"], Dict[str, FieldMetadata]] = {}
+
+# Identity fields that should be skipped during tree building
+_IDENTITY_FIELDS = frozenset({
+    'ecs_id', 'live_id', 'created_at', 'forked_at', 'previous_ecs_id',
+    'old_ids', 'old_ecs_id', 'from_storage', 'attribute_source',
+    'root_ecs_id', 'root_live_id', 'lineage_id'
+})
+
+
+def get_cached_field_metadata(entity_class: Type["Entity"]) -> Dict[str, FieldMetadata]:
+    """
+    Get cached field metadata for an entity class.
+    
+    This analyzes the Pydantic field annotations once per class and caches the results,
+    avoiding repeated expensive type introspection during tree building.
+    
+    Args:
+        entity_class: The entity class to analyze
+        
+    Returns:
+        Dict mapping field names to FieldMetadata
+    """
+    if entity_class not in _FIELD_METADATA_CACHE:
+        metadata = {}
+        
+        for field_name, field_info in entity_class.model_fields.items():
+            # Check if identity field
+            is_identity = field_name in _IDENTITY_FIELDS
+            
+            # Analyze field type annotation
+            annotation = field_info.annotation
+            contains_entities = False
+            entity_type = None
+            container_type = None
+            
+            if not is_identity and annotation:
+                # Check for direct Entity type
+                try:
+                    if annotation == Entity or (isinstance(annotation, type) and issubclass(annotation, Entity)):
+                        contains_entities = True
+                        entity_type = annotation
+                except TypeError:
+                    pass
+                
+                # Handle Optional types
+                origin = get_origin(annotation)
+                if origin is Union:
+                    args = get_args(annotation)
+                    inner_type = next((arg for arg in args if arg is not type(None)), None)
+                    if inner_type:
+                        try:
+                            if inner_type == Entity or (isinstance(inner_type, type) and issubclass(inner_type, Entity)):
+                                contains_entities = True
+                                entity_type = inner_type
+                        except TypeError:
+                            pass
+                        origin = get_origin(inner_type) if inner_type else None
+                
+                # Handle container types
+                if origin in (list, set, tuple, dict):
+                    args = get_args(annotation)
+                    if origin is dict and len(args) >= 2:
+                        value_type = args[1]
+                        try:
+                            if value_type == Entity or (isinstance(value_type, type) and issubclass(value_type, Entity)):
+                                contains_entities = True
+                                entity_type = value_type
+                                container_type = 'dict'
+                        except TypeError:
+                            pass
+                    elif origin in (list, set, tuple) and args:
+                        item_type = args[0]
+                        try:
+                            if item_type == Entity or (isinstance(item_type, type) and issubclass(item_type, Entity)):
+                                contains_entities = True
+                                entity_type = item_type
+                                if origin is list:
+                                    container_type = 'list'
+                                elif origin is set:
+                                    container_type = 'set'
+                                elif origin is tuple:
+                                    container_type = 'tuple'
+                        except TypeError:
+                            pass
+            
+            metadata[field_name] = FieldMetadata(
+                name=field_name,
+                contains_entities=contains_entities,
+                entity_type=entity_type,
+                container_type=container_type,
+                is_identity_field=is_identity
+            )
+        
+        _FIELD_METADATA_CACHE[entity_class] = metadata
+    
+    return _FIELD_METADATA_CACHE[entity_class]
+
 
 def get_field_ownership(entity: "Entity", field_name: str) -> bool:
     """
@@ -714,38 +829,24 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
         if not entity_needs_processing:
             continue
             
-        # Process all fields if the entity hasn't been processed yet
-        for field_name in entity.model_fields:
+        # Get cached field metadata for this entity class (computed once per class)
+        field_metadata = get_cached_field_metadata(type(entity))
+        
+        # Process only fields that contain entities
+        for field_name, field_meta in field_metadata.items():
+            # Skip identity fields and non-entity fields
+            if field_meta.is_identity_field or not field_meta.contains_entities:
+                continue
+            
             value = getattr(entity, field_name)
             
             # Skip None values
             if value is None:
                 continue
             
-            # Get expected type for this field
-            field_type = get_pydantic_field_type_entities(entity, field_name)
-            
-            # Direct entity reference
-            if isinstance(value, Entity):
-                # Add entity to tree if not already present
-                if value.ecs_id not in tree.nodes:
-                    tree.add_entity(value)
-                
-                # Add the appropriate edge type
-                process_entity_reference(
-                    tree=tree,
-                    source=entity,
-                    target=value,
-                    field_name=field_name,
-                    to_process=None,  # We'll handle queue manually
-                    distance_map=None  # Not using distance map in single-pass version
-                )
-                
-                # Add to processing queue
-                to_process.append((value, entity.ecs_id))
-            
-            # List of entities
-            elif isinstance(value, list) and field_type:
+            # Handle based on container type from cached metadata
+            if field_meta.container_type == 'list':
+                # List of entities
                 for i, item in enumerate(value):
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
@@ -766,8 +867,8 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
             
-            # Dict of entities
-            elif isinstance(value, dict) and field_type:
+            elif field_meta.container_type == 'dict':
+                # Dict of entities
                 for k, v in value.items():
                     if isinstance(v, Entity):
                         # Add entity to tree if not already present
@@ -788,8 +889,8 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((v, entity.ecs_id))
             
-            # Tuple of entities
-            elif isinstance(value, tuple) and field_type:
+            elif field_meta.container_type == 'tuple':
+                # Tuple of entities
                 for i, item in enumerate(value):
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
@@ -810,8 +911,8 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
             
-            # Set of entities
-            elif isinstance(value, set) and field_type:
+            elif field_meta.container_type == 'set':
+                # Set of entities
                 for item in value:
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
@@ -830,6 +931,26 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
+            
+            else:
+                # Direct entity reference (no container)
+                if isinstance(value, Entity):
+                    # Add entity to tree if not already present
+                    if value.ecs_id not in tree.nodes:
+                        tree.add_entity(value)
+                    
+                    # Add the appropriate edge type
+                    process_entity_reference(
+                        tree=tree,
+                        source=entity,
+                        target=value,
+                        field_name=field_name,
+                        to_process=None,  # We'll handle queue manually
+                        distance_map=None  # Not using distance map in single-pass version
+                    )
+                    
+                    # Add to processing queue
+                    to_process.append((value, entity.ecs_id))
     
     # Ensure all entities have an ancestry path
     # This is just a safety check - all entities should have paths by now
