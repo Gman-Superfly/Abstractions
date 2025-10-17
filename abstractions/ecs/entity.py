@@ -637,6 +637,11 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
     """
     Build a complete entity tree from a root entity in a single pass.
     
+    PROFILING NOTE: If this is slow, check:
+    - Number of entities being traversed
+    - Number of fields per entity
+    - Deep nesting of entity hierarchies
+    
     This algorithm:
     1. Builds the tree structure and ancestry paths in a single traversal
     2. Immediately classifies edges based on ownership

@@ -685,8 +685,9 @@ class CallableRegistry:
                 entity_name, entity_obj = next(iter(entity_params.items()))
                 
                 # Create temporary metadata for the partial function
+                # Keep original name for proper tracking
                 partial_metadata = FunctionMetadata(
-                    name=f"{metadata.name}_partial",
+                    name=metadata.name,  # Use original name, not _partial
                     signature_str=str(signature(partial_func)),
                     docstring=metadata.docstring,
                     is_async=metadata.is_async,
@@ -722,8 +723,9 @@ class CallableRegistry:
                 composite_input.promote_to_root()
                 
                 # Create metadata for partial function with composite input
+                # Keep original name for proper tracking
                 partial_metadata = FunctionMetadata(
-                    name=f"{metadata.name}_partial",
+                    name=metadata.name,  # Use original name, not _partial
                     signature_str=str(signature(partial_func)),
                     docstring=metadata.docstring,
                     is_async=metadata.is_async,
@@ -927,8 +929,10 @@ class CallableRegistry:
             )
         else:
             # Use traditional single-entity processing
+            execution_id = uuid4()  # Create execution_id for tracking
+            
             output_entity = await cls._create_output_entity_with_provenance(
-                result, metadata.output_entity_class, input_entity, metadata.name
+                result, metadata.output_entity_class, input_entity, metadata.name, execution_id
             )
             
             # Register output entity (automatic versioning)
@@ -1007,7 +1011,7 @@ class CallableRegistry:
             )
         else:
             # Use single-entity result processing for single-entity returns
-            return await cls._finalize_single_entity_result(result, metadata, object_identity_map)
+            return await cls._finalize_single_entity_result(result, metadata, object_identity_map, execution_id)
     
     @classmethod
     async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
@@ -1147,7 +1151,8 @@ class CallableRegistry:
         cls,
         result: Any,
         metadata: FunctionMetadata,
-        object_identity_map: Dict[int, Entity]
+        object_identity_map: Dict[int, Entity],
+        execution_id: Optional[UUID] = None
     ) -> Entity:
         """
         Single-entity result finalization with object identity-based semantic detection.
@@ -1161,31 +1166,15 @@ class CallableRegistry:
         
         # Handle entity results with semantic detection
         if isinstance(result, Entity):
+            if execution_id is None:
+                execution_id = uuid4()
+            
             semantic, original_entity = cls._detect_execution_semantic(result, object_identity_map)
             
-            if semantic == "mutation":
-                # MUTATION: Function modified input entity in-place
-                if original_entity:
-                    # Preserve lineage, update ecs_id for versioning
-                    result.update_ecs_ids()
-                    # Register the updated entity (this should NOT conflict)
-                    EntityRegistry.register_entity(result)
-                    # Version the original entity to maintain history
-                    EntityRegistry.version_entity(original_entity)
-                else:
-                    # Fallback: treat as creation if we can't find original
-                    result.promote_to_root()
-                    
-            elif semantic == "creation":
-                # CREATION: Function created completely new entity
-                result.promote_to_root()
-                
-            elif semantic == "detachment":
-                # DETACHMENT: Function extracted child from parent tree
-                result.detach()
-                # Version the parent entity to reflect the change
-                if original_entity:
-                    EntityRegistry.version_entity(original_entity)
+            # Call _apply_semantic_actions to set tracking fields and handle semantics
+            result = await cls._apply_semantic_actions(
+                result, semantic, original_entity, metadata, execution_id
+            )
             
             return result
         
@@ -1303,9 +1292,9 @@ class CallableRegistry:
         if semantic == "mutation":
             # Handle mutation: preserve lineage, update IDs
             if original_entity:
-                entity.update_ecs_ids()
-                EntityRegistry.register_entity(entity)
-                EntityRegistry.version_entity(original_entity)
+                # FIX: Version BEFORE update_ecs_ids so we can compare against the correct old tree
+                # version_entity will handle updating IDs for modified entities internally
+                EntityRegistry.version_entity(entity)
             else:
                 # Fallback: treat as creation if we can't find original
                 if not entity.is_root_entity():
@@ -1460,7 +1449,8 @@ class CallableRegistry:
         result: Any,
         output_entity_class: Type[Entity],
         input_entity: Entity,
-        function_name: str
+        function_name: str,
+        execution_id: Optional[UUID] = None
     ) -> Entity:
         """
         Create output entity with complete provenance tracking.
@@ -1472,9 +1462,14 @@ class CallableRegistry:
         if isinstance(result, Entity):
             output_entity = result
             
+            if execution_id is None:
+                execution_id = uuid4()
+            
             # Set Phase 4 provenance fields after entity creation
             if hasattr(output_entity, 'derived_from_function'):
                 output_entity.derived_from_function = function_name
+            if hasattr(output_entity, 'derived_from_execution_id'):
+                output_entity.derived_from_execution_id = execution_id
             
             # Set up complete provenance tracking only for non-system fields
             for field_name in output_entity.model_fields:
@@ -1638,9 +1633,17 @@ class CallableRegistry:
             raise
         
         # Create output entity
+        execution_id = uuid4()  # Create execution_id for tracking
+        
         if isinstance(result, Entity):
             output_entity = result
             output_entity.promote_to_root()
+            
+            # Set tracking fields
+            if hasattr(output_entity, 'derived_from_function'):
+                output_entity.derived_from_function = metadata.name
+            if hasattr(output_entity, 'derived_from_execution_id'):
+                output_entity.derived_from_execution_id = execution_id
         else:
             # Handle non-entity result using consistent field detection
             output_entity = cls._create_output_entity_from_result(result, metadata.output_entity_class, metadata.name)
