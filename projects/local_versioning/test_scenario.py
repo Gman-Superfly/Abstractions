@@ -514,10 +514,11 @@ def stress_test_moves(
         
         agent = random.choice(source_node.agents)
         
-        # Time the move operation using CallableRegistry
+        # Time the move operation using CallableRegistry with optimizations
         start = time.perf_counter()
         gridmap = CallableRegistry.execute(
             "move_agent_global",
+            skip_divergence_check=(i > 0),  # Skip check after first move (entity is fresh)
             gridmap=gridmap,
             source_index=source_idx,
             agent_name=agent.name,

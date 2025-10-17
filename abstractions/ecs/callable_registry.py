@@ -413,9 +413,16 @@ class CallableRegistry:
         return decorator
     
     @classmethod
-    def execute(cls, func_name: str, **kwargs) -> Union[Entity, List[Entity]]:
-        """Execute function using entity-native patterns (sync wrapper)."""
-        return asyncio.run(cls.aexecute(func_name, **kwargs))
+    def execute(cls, func_name: str, skip_divergence_check: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
+        """
+        Execute function using entity-native patterns (sync wrapper).
+        
+        Args:
+            func_name: Name of registered function
+            skip_divergence_check: If True, skip divergence check for performance (assumes entity is fresh)
+            **kwargs: Function arguments
+        """
+        return asyncio.run(cls.aexecute(func_name, skip_divergence_check=skip_divergence_check, **kwargs))
     
     @classmethod
     @emit_events(
@@ -565,8 +572,15 @@ class CallableRegistry:
             return "pure_borrowing"             # Address-based borrowing and mixed patterns (fallback)
     
     @classmethod
-    async def _execute_async(cls, func_name: str, **kwargs) -> Union[Entity, List[Entity]]:
-        """Execute function with comprehensive strategy detection and routing."""
+    async def _execute_async(cls, func_name: str, skip_divergence_check: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
+        """
+        Execute function with comprehensive strategy detection and routing.
+        
+        Args:
+            func_name: Name of registered function
+            skip_divergence_check: If True, skip divergence check (faster, but assumes entity is fresh)
+            **kwargs: Function arguments
+        """
         # Step 1: Get function metadata
         metadata = cls.get_metadata(func_name)
         if not metadata:
@@ -577,23 +591,23 @@ class CallableRegistry:
         
         # Step 3: Route to appropriate execution strategy
         if strategy == "single_entity_with_config":
-            return await cls._execute_with_partial(metadata, kwargs)
+            return await cls._execute_with_partial(metadata, kwargs, skip_divergence_check=skip_divergence_check)
         elif strategy == "no_inputs":
             return await cls._execute_no_inputs(metadata)
         elif strategy in ["multi_entity_composite", "single_entity_direct"]:
             # Use pattern classification for existing logic
             pattern_type, classification = InputPatternClassifier.classify_kwargs(kwargs)
             if pattern_type in ["pure_transactional", "mixed"]:
-                return await cls._execute_transactional(metadata, kwargs, classification)
+                return await cls._execute_transactional(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
             else:
-                return await cls._execute_borrowing(metadata, kwargs, classification)
+                return await cls._execute_borrowing(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
         else:  # pure_borrowing
             pattern_type, classification = InputPatternClassifier.classify_kwargs(kwargs)
-            return await cls._execute_borrowing(metadata, kwargs, classification)
+            return await cls._execute_borrowing(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
     
     @classmethod
     @emit_events(
-        creating_factory=lambda cls, metadata, kwargs: InputPreparationEvent(
+        creating_factory=lambda cls, metadata, kwargs, skip_divergence_check=False: InputPreparationEvent(
             process_name="input_preparation",
             function_name=metadata.name,
             preparation_type="config_creation",
@@ -604,7 +618,7 @@ class CallableRegistry:
             pattern_classification="partial_execution",
             borrowing_operations_needed=0
         ),
-        created_factory=lambda result, cls, metadata, kwargs: InputPreparedEvent(
+        created_factory=lambda result, cls, metadata, kwargs, skip_divergence_check=False: InputPreparedEvent(
             process_name="input_preparation",
             function_name=metadata.name,
             preparation_successful=True,
@@ -619,7 +633,7 @@ class CallableRegistry:
             preparation_duration_ms=0.0
         )
     )
-    async def _execute_with_partial(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any]) -> Union[Entity, List[Entity]]:
+    async def _execute_with_partial(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], skip_divergence_check: bool = False) -> Union[Entity, List[Entity]]:
         """Execute using functools.partial for single_entity_with_config pattern."""
         
         # Step 1: Separate entity and config parameters
@@ -867,7 +881,7 @@ class CallableRegistry:
         return False
     
     @classmethod
-    async def _execute_borrowing(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None) -> Union[Entity, List[Entity]]:
+    async def _execute_borrowing(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None, skip_divergence_check: bool = False) -> Union[Entity, List[Entity]]:
         """Execute using borrowing pattern (data composition)."""
         
         # Create input entity with borrowing (enhanced pattern)
@@ -969,7 +983,7 @@ class CallableRegistry:
             transaction_id=uuid4()
         )
     )
-    async def _execute_transactional(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None) -> Union[Entity, List[Entity]]:
+    async def _execute_transactional(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None, skip_divergence_check: bool = False) -> Union[Entity, List[Entity]]:
         """
         Enhanced execute with complete semantic detection and Phase 2 unpacking.
         
@@ -984,7 +998,7 @@ class CallableRegistry:
         start_time = time.time()
         
         # Step 1: Prepare isolated execution environment with object identity tracking
-        execution_kwargs, original_entities, execution_copies, object_identity_map = await cls._prepare_transactional_inputs(kwargs)
+        execution_kwargs, original_entities, execution_copies, object_identity_map = await cls._prepare_transactional_inputs(kwargs, skip_divergence_check)
         
         # Extract input entity for tracking (first original entity if available)
         input_entity = original_entities[0] if original_entities else None
@@ -1014,7 +1028,7 @@ class CallableRegistry:
             return await cls._finalize_single_entity_result(result, metadata, object_identity_map, execution_id)
     
     @classmethod
-    async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
+    async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any], skip_divergence_check: bool = False) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
         """
         Prepare inputs for transactional execution with complete isolation.
         
@@ -1028,34 +1042,24 @@ class CallableRegistry:
         
         for param_name, value in kwargs.items():
             if isinstance(value, Entity):
-                # Check if entity has diverged from storage
-                await cls._check_entity_divergence(value)
+                # Check if entity has diverged from storage (unless skipped)
+                if not skip_divergence_check:
+                    await cls._check_entity_divergence(value)
                 
                 # Store original for lineage tracking
                 original_entities.append(value)
                 
                 # Create isolated execution copy
-                if value.root_ecs_id:
-                    copy = EntityRegistry.get_stored_entity(value.root_ecs_id, value.ecs_id)
-                    if copy:
-                        execution_copies.append(copy)
-                        execution_kwargs[param_name] = copy
-                        # Track object identity mapping
-                        object_identity_map[id(copy)] = value
-                    else:
-                        # Entity not in storage, use direct copy with new live_id
-                        copy = value.model_copy(deep=True)
-                        copy.live_id = uuid4()
-                        execution_copies.append(copy)
-                        execution_kwargs[param_name] = copy
-                        object_identity_map[id(copy)] = value
-                else:
-                    # Orphan entity, create isolated copy
-                    copy = value.model_copy(deep=True)
-                    copy.live_id = uuid4()
-                    execution_copies.append(copy)
-                    execution_kwargs[param_name] = copy
-                    object_identity_map[id(copy)] = value
+                # Entity is either:
+                # 1. Fresh from divergence check (if not skipped), OR
+                # 2. Trusted by caller (if skipped)
+                # So we can safely copy directly without fetching from storage
+                copy = value.model_copy(deep=True)
+                copy.live_id = uuid4()
+                
+                execution_copies.append(copy)
+                execution_kwargs[param_name] = copy
+                object_identity_map[id(copy)] = value
             else:
                 # Non-entity values pass through
                 execution_kwargs[param_name] = value
@@ -1080,9 +1084,9 @@ class CallableRegistry:
                 EntityRegistry.register_entity(entity)
             return
         
-        # Compare with stored version
+        # Compare with stored version (use read-only tree for performance)
         current_tree = build_entity_tree(entity)
-        stored_tree = EntityRegistry.get_stored_tree(entity.root_ecs_id)
+        stored_tree = EntityRegistry.get_stored_tree(entity.root_ecs_id, read_only=True)
         
         if stored_tree:
             modified_entities = find_modified_entities(current_tree, stored_tree)

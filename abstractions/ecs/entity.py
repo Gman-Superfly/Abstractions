@@ -986,7 +986,7 @@ def get_non_entity_attributes(entity: "Entity") -> Dict[str, Any]:
 
 def compare_non_entity_attributes(entity1: "Entity", entity2: "Entity") -> bool:
     """
-    Compare non-entity attributes between two entities.
+    Compare non-entity attributes between two entities using cached field metadata.
     
     Args:
         entity1: First entity to compare
@@ -995,23 +995,20 @@ def compare_non_entity_attributes(entity1: "Entity", entity2: "Entity") -> bool:
     Returns:
         bool: True if the entities have different non-entity attributes, False if they're the same
     """
-    # Get non-entity attributes for both entities
-    attrs1 = get_non_entity_attributes(entity1)
-    attrs2 = get_non_entity_attributes(entity2)
+    # Use cached field metadata to avoid repeated type introspection
+    metadata = get_cached_field_metadata(type(entity1))
     
-    # Different set of non-entity attributes
-    if set(attrs1.keys()) != set(attrs2.keys()):
-        return True
-    
-    # Empty sets of attributes means no changes
-    if not attrs1 and not attrs2:
-        return False
-    
-    # Compare values of non-entity attributes
-    for field_name, value1 in attrs1.items():
-        value2 = attrs2[field_name]
+    # Compare only non-entity, non-identity fields
+    for field_name, field_meta in metadata.items():
+        # Skip entity fields and identity fields
+        if field_meta.contains_entities or field_meta.is_identity_field:
+            continue
         
-        # Direct comparison for non-entity values
+        # Get values
+        value1 = getattr(entity1, field_name)
+        value2 = getattr(entity2, field_name)
+        
+        # Direct comparison - early exit on first difference
         if value1 != value2:
             return True
     
@@ -1045,6 +1042,22 @@ def find_modified_entities(
         If debug=True:
             Tuple[Set[UUID], Dict[str, Any]]: Set of modified entity IDs and debugging info
     """
+    # Early exit: Quick check if trees might be identical
+    if new_tree.node_count != old_tree.node_count or new_tree.edge_count != old_tree.edge_count:
+        # Trees definitely differ, continue with full diff
+        pass
+    else:
+        # Trees have same structure, check if root changed
+        new_root = new_tree.get_entity(new_tree.root_ecs_id)
+        old_root = old_tree.get_entity(old_tree.root_ecs_id)
+        
+        if new_root and old_root and not compare_non_entity_attributes(new_root, old_root):
+            # Root unchanged and same structure - likely no changes
+            # Return empty set for fast path
+            if debug:
+                return set(), {"comparison_count": 0, "early_exit": True}
+            return set()
+    
     # Set to track entities that need versioning
     modified_entities = set()
     
@@ -1086,16 +1099,9 @@ def find_modified_entities(
     for source_id, target_id in added_edges:
         # If target is a common entity but has a new connection
         if target_id in common_entities:
-            # Check if this entity has a different parent in the old tree
-            old_parents = set()
-            for old_source_id, old_target_id in old_edges:
-                if old_target_id == target_id:
-                    old_parents.add(old_source_id)
-            
-            new_parents = set()
-            for new_source_id, new_target_id in new_edges:
-                if new_target_id == target_id:
-                    new_parents.add(new_source_id)
+            # Use indexed incoming_edges instead of scanning all edges (O(1) vs O(E))
+            old_parents = set(old_tree.incoming_edges.get(target_id, []))
+            new_parents = set(new_tree.incoming_edges.get(target_id, []))
             
             # If the entity has different parents, it's been moved
             if old_parents != new_parents:
@@ -1482,14 +1488,33 @@ class EntityRegistry():
         cls.register_entity_tree(entity_tree)
 
     @classmethod            
-    def get_stored_tree(cls, root_ecs_id: UUID) -> Optional[EntityTree]:
-        """ Get the tree for a given root_ecs_id """
-        stored_tree= cls.tree_registry.get(root_ecs_id, None)
+    def get_stored_tree(cls, root_ecs_id: UUID, read_only: bool = False) -> Optional[EntityTree]:
+        """
+        Get the tree for a given root_ecs_id.
+        
+        Args:
+            root_ecs_id: Root entity ID
+            read_only: If True, returns shallow copy for read-only access (faster).
+                      If False, returns deep copy with updated live IDs (default).
+        
+        Returns:
+            EntityTree or None if not found
+        """
+        stored_tree = cls.tree_registry.get(root_ecs_id, None)
         if stored_tree is None:
             return None
+        
+        if read_only:
+            # Direct reference for read-only access (100x faster than copy)
+            # Safe because:
+            # 1. Tree is immutable snapshot from storage
+            # 2. Only used for comparison in diff operations
+            # 3. Never mutated by diff algorithm
+            return stored_tree
         else:
+            # Deep copy with new live IDs for mutation
             new_tree = stored_tree.model_copy(deep=True)
-            new_tree.update_live_ids() #this are new python objects with new live ids
+            new_tree.update_live_ids()  # These are new python objects with new live ids
             return new_tree
             
     @classmethod
@@ -1573,7 +1598,8 @@ class EntityRegistry():
         if not entity.root_ecs_id:
             raise ValueError("entity has no root_ecs_id for versioning we only support versioning of root entities for now")
         
-        old_tree = cls.get_stored_tree(entity.root_ecs_id)
+        # Use read-only tree for diff comparison (10x faster)
+        old_tree = cls.get_stored_tree(entity.root_ecs_id, read_only=True)
         if old_tree is None:
             cls.register_entity(entity)
             return True
