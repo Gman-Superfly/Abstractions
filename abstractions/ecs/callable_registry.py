@@ -368,6 +368,9 @@ class FunctionMetadata:
     uses_config_entity: bool = field(init=False)
     config_entity_types: List[Type[ConfigEntity]] = field(default_factory=list, init=False)
     
+    # Tree structure preservation flag
+    preserve_tree_structure: bool = False  # If True, maintain tree relationships during copying
+    
     def __post_init__(self):
         """Initialize ConfigEntity support flags and Phase 2 analysis metadata."""
         self.uses_config_entity = self.input_pattern == "config_entity_pattern"
@@ -470,16 +473,17 @@ class CallableRegistry:
         return decorator
     
     @classmethod
-    def execute(cls, func_name: str, skip_divergence_check: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
+    def execute(cls, func_name: str, skip_divergence_check: bool = False, preserve_tree_structure: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
         """
         Execute function using entity-native patterns (sync wrapper).
         
         Args:
             func_name: Name of registered function
             skip_divergence_check: If True, skip divergence check for performance (assumes entity is fresh)
+            preserve_tree_structure: If True, maintain tree relationships during copying
             **kwargs: Function arguments
         """
-        return asyncio.run(cls.aexecute(func_name, skip_divergence_check=skip_divergence_check, **kwargs))
+        return asyncio.run(cls.aexecute(func_name, skip_divergence_check=skip_divergence_check, preserve_tree_structure=preserve_tree_structure, **kwargs))
     
     @classmethod
     @emit_events(
@@ -515,9 +519,9 @@ class CallableRegistry:
             execution_id=None  # Will be populated during execution
         )
     )
-    async def aexecute(cls, func_name: str, **kwargs) -> Union[Entity, List[Entity]]:
+    async def aexecute(cls, func_name: str, skip_divergence_check: bool = False, preserve_tree_structure: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
         """Execute function using entity-native patterns (async)."""
-        return await cls._execute_async(func_name, **kwargs)
+        return await cls._execute_async(func_name, skip_divergence_check=skip_divergence_check, preserve_tree_structure=preserve_tree_structure, **kwargs)
     
     @classmethod
     async def _create_input_entity_with_borrowing(
@@ -629,7 +633,7 @@ class CallableRegistry:
             return "pure_borrowing"             # Address-based borrowing and mixed patterns (fallback)
     
     @classmethod
-    async def _execute_async(cls, func_name: str, skip_divergence_check: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
+    async def _execute_async(cls, func_name: str, skip_divergence_check: bool = False, preserve_tree_structure: bool = False, **kwargs) -> Union[Entity, List[Entity]]:
         """
         Execute function with comprehensive strategy detection and routing.
         
@@ -661,7 +665,7 @@ class CallableRegistry:
             pattern_type, classification = InputPatternClassifier.classify_kwargs(kwargs)
             _perf_timer.record("3_classify_pattern", (time.perf_counter() - t0) * 1000)
             if pattern_type in ["pure_transactional", "mixed"]:
-                return await cls._execute_transactional(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
+                return await cls._execute_transactional(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check, preserve_tree_structure=preserve_tree_structure)
             else:
                 return await cls._execute_borrowing(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
         else:  # pure_borrowing
@@ -1024,7 +1028,7 @@ class CallableRegistry:
             return output_entity
     
     @classmethod
-    async def _execute_transactional(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None, skip_divergence_check: bool = False) -> Union[Entity, List[Entity]]:
+    async def _execute_transactional(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None, skip_divergence_check: bool = False, preserve_tree_structure: bool = False) -> Union[Entity, List[Entity]]:
         """
         Enhanced execute with complete semantic detection and Phase 2 unpacking.
         
@@ -1040,7 +1044,11 @@ class CallableRegistry:
         
         # Step 1: Prepare isolated execution environment with object identity tracking
         t0 = time.perf_counter()
-        execution_kwargs, original_entities, execution_copies, object_identity_map = await cls._prepare_transactional_inputs(kwargs, skip_divergence_check)
+        execution_kwargs, original_entities, execution_copies, object_identity_map, root_copies_map = await cls._prepare_transactional_inputs(
+            kwargs, 
+            skip_divergence_check, 
+            preserve_tree_structure=preserve_tree_structure
+        )
         _perf_timer.record("4_prepare_inputs", (time.perf_counter() - t0) * 1000)
         
         # Extract input entity for tracking (first original entity if available)
@@ -1072,6 +1080,13 @@ class CallableRegistry:
                 result = await cls._finalize_single_entity_result(result, metadata, object_identity_map, execution_id)
             
             _perf_timer.record("6_finalize_result", (time.perf_counter() - t0) * 1000)
+            
+            # Step 4: Version affected trees if preserve_tree_structure is enabled
+            if preserve_tree_structure and root_copies_map:
+                t0 = time.perf_counter()
+                await cls._version_affected_trees(result, original_entities, root_copies_map)
+                _perf_timer.record("7_version_trees", (time.perf_counter() - t0) * 1000)
+            
             return result
         except Exception as e:
             execution_duration = time.time() - start_time
@@ -1079,39 +1094,172 @@ class CallableRegistry:
             raise
     
     @classmethod
-    async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any], skip_divergence_check: bool = False) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
+    async def _version_affected_trees(cls, result: Union[Entity, List[Entity]], original_entities: List[Entity], root_copies_map: Dict[UUID, Entity]) -> None:
+        """
+        Version trees affected by the execution.
+        
+        Versions both:
+        - Trees that output entities belong to (after execution)
+        - Trees that output entities belonged to (before execution, if different)
+        
+        Args:
+            result: Function execution result (entity or list of entities)
+            original_entities: Original input entities (before copying)
+            root_copies_map: Map of root_ecs_id -> copied root entity
+        """
+        # Extract output entities from result
+        output_entities = []
+        if isinstance(result, Entity):
+            output_entities = [result]
+        elif isinstance(result, list):
+            output_entities = [e for e in result if isinstance(e, Entity)]
+        
+        # Track input tree membership (before execution) by lineage_id
+        input_tree_membership = {}
+        for entity in original_entities:
+            root_id = entity.root_ecs_id if entity.root_ecs_id else entity.ecs_id
+            if entity.lineage_id:
+                input_tree_membership[entity.lineage_id] = root_id
+        
+        # Collect all trees that need versioning
+        trees_to_version = set()
+        
+        for output_entity in output_entities:
+            # Tree the entity belongs to NOW (after execution)
+            current_tree_id = output_entity.root_ecs_id if output_entity.root_ecs_id else output_entity.ecs_id
+            trees_to_version.add(current_tree_id)
+            
+            # Tree the entity belonged to BEFORE (at input)
+            # Use lineage_id to track entities across copies
+            if output_entity.lineage_id and output_entity.lineage_id in input_tree_membership:
+                original_tree_id = input_tree_membership[output_entity.lineage_id]
+                if original_tree_id != current_tree_id:
+                    # Entity moved trees! Version both
+                    trees_to_version.add(original_tree_id)
+        
+        # Version each affected tree
+        for tree_id in trees_to_version:
+            if tree_id in root_copies_map:
+                root_copy = root_copies_map[tree_id]
+                # Ensure it's promoted to root
+                if not root_copy.is_root_entity():
+                    root_copy.promote_to_root()
+                # Version the tree (not register - it's already registered!)
+                EntityRegistry.version_entity(root_copy, force_versioning=True)
+    
+    @classmethod
+    async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any], skip_divergence_check: bool = False, preserve_tree_structure: bool = False) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
         """
         Prepare inputs for transactional execution with complete isolation.
         
+        Args:
+            kwargs: Function arguments
+            skip_divergence_check: Skip divergence check for performance
+            preserve_tree_structure: If True, maintain tree relationships during copying
+        
         Returns:
-            Tuple of (execution_kwargs, original_entities, execution_copies, object_identity_map)
+            Tuple of (execution_kwargs, original_entities, execution_copies, object_identity_map, root_copies_map)
+            root_copies_map: Maps root_ecs_id -> copied root entity (for tree versioning)
         """
         execution_kwargs = {}
         original_entities = []
         execution_copies = []
         object_identity_map = {}  # Maps id(execution_copy) -> original_entity
+        root_copies_map = {}  # Maps root_ecs_id -> copied root entity
         
-        for param_name, value in kwargs.items():
-            if isinstance(value, Entity):
-                # Check if entity has diverged from storage (unless skipped)
-                if not skip_divergence_check:
-                    await cls._check_entity_divergence(value)
+        # If preserve_tree_structure is True, detect same-tree entities
+        if preserve_tree_structure:
+            # Group entities by root_ecs_id
+            entities_by_root: Dict[UUID, List[Tuple[str, Entity]]] = {}
+            non_entity_params = {}
+            
+            for param_name, value in kwargs.items():
+                if isinstance(value, Entity):
+                    # Check divergence first
+                    if not skip_divergence_check:
+                        await cls._check_entity_divergence(value)
+                    
+                    original_entities.append(value)
+                    
+                    # Group by root_ecs_id
+                    root_id = value.root_ecs_id if value.root_ecs_id else value.ecs_id
+                    if root_id not in entities_by_root:
+                        entities_by_root[root_id] = []
+                    entities_by_root[root_id].append((param_name, value))
+                else:
+                    non_entity_params[param_name] = value
+            
+            # For each root, copy tree once and map entities
+            for root_id, entities_list in entities_by_root.items():
+                # Always copy the full tree when preserve_tree_structure=True
+                # This ensures we can version the tree later
                 
-                # Store original for lineage tracking
-                original_entities.append(value)
+                # Find the root entity (the one where ecs_id == root_ecs_id)
+                root_entity = None
+                for _, entity in entities_list:
+                    if entity.is_root_entity():
+                        root_entity = entity
+                        break
                 
-                # Create isolated execution copy
-                copy = value.model_copy(deep=True)
-                copy.live_id = uuid4()
+                if root_entity is None:
+                    # No root in inputs, fetch from registry
+                    root_entity = EntityRegistry.get_stored_entity(root_id, root_id)
                 
-                execution_copies.append(copy)
-                execution_kwargs[param_name] = copy
-                object_identity_map[id(copy)] = value
-            else:
-                # Non-entity values pass through
-                execution_kwargs[param_name] = value
+                if root_entity:
+                    # Copy the root tree
+                    root_copy = root_entity.model_copy(deep=True)
+                    root_copy.live_id = uuid4()
+                    
+                    # Store root copy for later versioning
+                    root_copies_map[root_id] = root_copy
+                    
+                    # Build tree to get all entity copies
+                    from abstractions.ecs.entity import build_entity_tree
+                    tree = build_entity_tree(root_copy)
+                    
+                    # Map each input entity to its copy in the tree
+                    for param_name, original_entity in entities_list:
+                        if original_entity.ecs_id in tree.nodes:
+                            copy_entity = tree.nodes[original_entity.ecs_id]
+                            execution_copies.append(copy_entity)
+                            execution_kwargs[param_name] = copy_entity
+                            object_identity_map[id(copy_entity)] = original_entity
+                        else:
+                            # Fallback: entity not in tree, copy independently
+                            copy = original_entity.model_copy(deep=True)
+                            copy.live_id = uuid4()
+                            execution_copies.append(copy)
+                            execution_kwargs[param_name] = copy
+                            object_identity_map[id(copy)] = original_entity
+                else:
+                    # Can't find root - this is an error
+                    raise ValueError(f"Entity has root_ecs_id={root_id} but root not found in storage. This indicates an orphaned entity.")
+            
+            # Add non-entity params
+            execution_kwargs.update(non_entity_params)
+        else:
+            # Default behavior: independent copies
+            for param_name, value in kwargs.items():
+                if isinstance(value, Entity):
+                    # Check if entity has diverged from storage (unless skipped)
+                    if not skip_divergence_check:
+                        await cls._check_entity_divergence(value)
+                    
+                    # Store original for lineage tracking
+                    original_entities.append(value)
+                    
+                    # Create isolated execution copy
+                    copy = value.model_copy(deep=True)
+                    copy.live_id = uuid4()
+                    
+                    execution_copies.append(copy)
+                    execution_kwargs[param_name] = copy
+                    object_identity_map[id(copy)] = value
+                else:
+                    # Non-entity values pass through
+                    execution_kwargs[param_name] = value
         
-        return execution_kwargs, original_entities, execution_copies, object_identity_map
+        return execution_kwargs, original_entities, execution_copies, object_identity_map, root_copies_map
     
     @classmethod
     async def _check_entity_divergence(cls, entity: Entity) -> None:
