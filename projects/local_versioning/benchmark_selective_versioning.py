@@ -498,6 +498,8 @@ def stress_test_moves(
     # Perform operations
     print(f"Performing {num_operations} move operations...")
     
+    fetch_timings = []  # Track fetch times separately
+    
     for i in range(num_operations):
         # Pick random source and target nodes
         source_idx = random.randint(0, num_nodes - 1)
@@ -509,29 +511,53 @@ def stress_test_moves(
         
         # Pick random agent from source node
         source_node = gridmap.nodes[source_idx]
+        target_node = gridmap.nodes[target_idx]
+        
         if not source_node.agents:
             continue
         
         agent = random.choice(source_node.agents)
         
-        # Time the move operation using CallableRegistry with optimizations
+        # TIME ONLY THE EXECUTE CALL
         start = time.perf_counter()
-        gridmap = CallableRegistry.execute(
-            "move_agent_global",
-            skip_divergence_check=False,#(i > 0),  # Skip check after first move (entity is fresh)
-            gridmap=gridmap,
-            source_index=source_idx,
-            agent_name=agent.name,
-            target_index=target_idx
+        result = CallableRegistry.execute(
+            "move_agent_local",
+            preserve_tree_structure=True,
+            skip_divergence_check=(i > 0),
+            source_node=source_node,
+            agent=agent,
+            target_node=target_node
         )
         duration_ms = (time.perf_counter() - start) * 1000
-        
         metrics.add_timing(duration_ms)
+        
+        # DEBUG: Print registry size
+        if (i + 1) % 10 == 0:
+            registry_size = len(EntityRegistry.tree_registry)
+            print(f"    DEBUG: tree_registry size = {registry_size}")
+        
+        # FETCH GRIDMAP OUTSIDE TIMING (track separately)
+        fetch_start = time.perf_counter()
+        if result and len(result) >= 2:
+            new_root_id = result[0].root_ecs_id
+            if new_root_id:
+                # Use read_only=True to avoid expensive deep copy
+                tree = EntityRegistry.get_stored_tree(new_root_id, read_only=True)
+                if tree:
+                    gridmap = tree.get_entity(new_root_id)
+        fetch_duration = (time.perf_counter() - fetch_start) * 1000
+        fetch_timings.append(fetch_duration)
         
         # Progress indicator
         if (i + 1) % 10 == 0:
+            recent_exec = metrics.timings[-10:]
+            recent_fetch = fetch_timings[-10:]
+            exec_avg = sum(recent_exec) / len(recent_exec) if recent_exec else 0
+            fetch_avg = sum(recent_fetch) / len(recent_fetch) if recent_fetch else 0
+            # Check entity count
+            current_entity_count = gridmap.total_entities() if gridmap else 0
             print(f"  Progress: {i + 1}/{num_operations} operations "
-                  f"(avg: {sum(metrics.timings[-10:]) / 10:.3f} ms/op)")
+                  f"(exec avg: {exec_avg:.3f} ms/op, fetch avg: {fetch_avg:.3f} ms/op, entities: {current_entity_count})")
     
     print(f"✓ Completed {len(metrics.timings)} operations")
     

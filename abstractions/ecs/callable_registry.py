@@ -1138,28 +1138,32 @@ class CallableRegistry:
                     trees_to_version.add(original_tree_id)
         
         # Version each affected tree
+        import time
         for tree_id in trees_to_version:
             if tree_id in root_copies_map:
                 root_copy = root_copies_map[tree_id]
                 # Ensure it's promoted to root
                 if not root_copy.is_root_entity():
                     root_copy.promote_to_root()
-                # Version the tree (not register - it's already registered!)
-                EntityRegistry.version_entity(root_copy, force_versioning=True)
+                # Version the tree - let diff algorithm detect what changed
+                version_start = time.perf_counter()
+                EntityRegistry.version_entity(root_copy, force_versioning=False)
+                version_time = (time.perf_counter() - version_start) * 1000
+                if version_time > 10:
+                    print(f"    VERSION TIME: {version_time:.1f}ms (registry_size={len(EntityRegistry.tree_registry)})")
     
     @classmethod
-    async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any], skip_divergence_check: bool = False, preserve_tree_structure: bool = False) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
+    async def _prepare_transactional_inputs(
+        cls,
+        kwargs: Dict[str, Any],
+        skip_divergence_check: bool = False,
+        preserve_tree_structure: bool = False
+    ) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity], Dict[UUID, Entity]]:
         """
-        Prepare inputs for transactional execution with complete isolation.
-        
-        Args:
-            kwargs: Function arguments
-            skip_divergence_check: Skip divergence check for performance
-            preserve_tree_structure: If True, maintain tree relationships during copying
+        Prepare inputs for transactional execution.
         
         Returns:
             Tuple of (execution_kwargs, original_entities, execution_copies, object_identity_map, root_copies_map)
-            root_copies_map: Maps root_ecs_id -> copied root entity (for tree versioning)
         """
         execution_kwargs = {}
         original_entities = []
@@ -1203,19 +1207,21 @@ class CallableRegistry:
                 
                 if root_entity is None:
                     # No root in inputs, fetch from registry
-                    root_entity = EntityRegistry.get_stored_entity(root_id, root_id)
+                    # Use read_only=False to get a COPIED tree - entities in it are already copies!
+                    tree = EntityRegistry.get_stored_tree(root_id, read_only=False)
+                    if tree:
+                        root_entity = tree.get_entity(root_id)
                 
-                if root_entity:
-                    # Copy the root tree
-                    root_copy = root_entity.model_copy(deep=True)
+                if root_entity and tree:
+                    # Entity is already a copy from get_stored_tree(read_only=False)
+                    # Just update live_id and use it directly
+                    root_copy = root_entity
                     root_copy.live_id = uuid4()
                     
                     # Store root copy for later versioning
                     root_copies_map[root_id] = root_copy
                     
-                    # Build tree to get all entity copies
-                    from abstractions.ecs.entity import build_entity_tree
-                    tree = build_entity_tree(root_copy)
+                    # Use the copied tree directly (no need to rebuild!)
                     
                     # Map each input entity to its copy in the tree
                     for param_name, original_entity in entities_list:
@@ -1499,7 +1505,10 @@ class CallableRegistry:
                 # version_entity will handle updating IDs for modified entities internally
                 t0 = time.perf_counter()
                 EntityRegistry.version_entity(entity)
-                _perf_timer.record("9_version_entity", (time.perf_counter() - t0) * 1000)
+                version_time = (time.perf_counter() - t0) * 1000
+                _perf_timer.record("9_version_entity", version_time)
+                if version_time > 10:
+                    print(f"    GLOBAL VERSION TIME: {version_time:.1f}ms (registry_size={len(EntityRegistry.tree_registry)})")
             else:
                 # Fallback: treat as creation if we can't find original
                 if not entity.is_root_entity():

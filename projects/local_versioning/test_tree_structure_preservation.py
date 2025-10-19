@@ -109,6 +109,34 @@ def process_nodes_orphan(node1: Node, node2: Node) -> Tuple[Node, Node]:
     return node1, node2
 
 
+@CallableRegistry.register("move_agent_return_target_only")
+def move_agent_return_target_only(source_node: Node, target_node: Node, agent: Agent) -> Node:
+    """
+    SCENARIO 5: Cross-tree movement, only return target.
+    
+    Tests output filtering - source tree should NOT be versioned.
+    """
+    source_node.agents.remove(agent)
+    target_node.agents.append(agent)
+    return target_node  # Only return target!
+
+
+@CallableRegistry.register("move_agent_within_tree_return_one")
+def move_agent_within_tree_return_one(gridmap: GridMap, source_idx: int, target_idx: int, agent: Agent) -> Node:
+    """
+    SCENARIO 6: Within-tree movement, only return one node.
+    
+    Tests that modifications are visible in non-returned nodes.
+    """
+    source_node = gridmap.nodes[source_idx]
+    target_node = gridmap.nodes[target_idx]
+    
+    source_node.agents.remove(agent)
+    target_node.agents.append(agent)
+    
+    return target_node  # Only return target node
+
+
 def test_scenario_1_global_with_tree_preservation():
     """
     SCENARIO 1: GLOBAL with tree preservation
@@ -552,12 +580,162 @@ def test_scenario_4_pure_local():
         return False
 
 
+def test_scenario_5_output_filtering():
+    """
+    SCENARIO 5: Cross-tree output filtering
+    
+    Move agent from Tree A to Tree B, but only return target node.
+    Expected: Tree A should NOT be versioned (no outputs from it).
+    """
+    print("\n" + "="*70)
+    print("SCENARIO 5: Cross-tree output filtering")
+    print("="*70)
+    
+    # Create two gridmaps
+    gridmap_A = GridMap(nodes=[Node(agents=[Agent(name="agent1")])])
+    gridmap_A.promote_to_root()
+    
+    gridmap_B = GridMap(nodes=[Node(agents=[])])
+    gridmap_B.promote_to_root()
+    
+    node_A = gridmap_A.nodes[0]
+    node_B = gridmap_B.nodes[0]
+    agent = node_A.agents[0]
+    
+    original_gridmap_A_id = gridmap_A.ecs_id
+    original_gridmap_B_id = gridmap_B.ecs_id
+    
+    print(f"\nBEFORE:")
+    print(f"  GridMap A: {original_gridmap_A_id}")
+    print(f"  GridMap B: {original_gridmap_B_id}")
+    print(f"  Agents in A.nodes[0]: {len(node_A.agents)}")
+    print(f"  Agents in B.nodes[0]: {len(node_B.agents)}")
+    
+    # Execute - only returns target node
+    result = CallableRegistry.execute(
+        "move_agent_return_target_only",
+        preserve_tree_structure=True,
+        source_node=node_A,
+        target_node=node_B,
+        agent=agent
+    )
+    
+    print(f"\nAFTER:")
+    print(f"  Result.root_ecs_id: {result.root_ecs_id}")
+    print(f"  Agents in result: {len(result.agents)}")
+    
+    # Check gridmap_A (source) - should NOT be versioned
+    latest_A = EntityRegistry.get_stored_entity(original_gridmap_A_id, original_gridmap_A_id)
+    
+    print(f"\n  GridMap A (source - no outputs):")
+    if latest_A:
+        print(f"    ecs_id: {latest_A.ecs_id}")
+        print(f"    Same as original: {latest_A.ecs_id == original_gridmap_A_id}")
+        gridmap_A_not_versioned = (latest_A.ecs_id == original_gridmap_A_id)
+    else:
+        gridmap_A_not_versioned = False
+    
+    # Check gridmap_B (target) - should BE versioned
+    stored_B = EntityRegistry.get_stored_entity(result.root_ecs_id, result.root_ecs_id)
+    
+    print(f"\n  GridMap B (target - has output):")
+    if stored_B:
+        print(f"    ecs_id: {stored_B.ecs_id}")
+        print(f"    Different from original: {stored_B.ecs_id != original_gridmap_B_id}")
+        print(f"    Agents in nodes[0]: {len(stored_B.nodes[0].agents)}")
+        gridmap_B_versioned = (stored_B.ecs_id != original_gridmap_B_id and len(stored_B.nodes[0].agents) == 1)
+    else:
+        gridmap_B_versioned = False
+    
+    if gridmap_A_not_versioned and gridmap_B_versioned:
+        print(f"\n✅ SCENARIO 5 PASSED: Output filtering works")
+        print(f"   - Source tree NOT versioned (no outputs)")
+        print(f"   - Target tree versioned (has output)")
+        return True
+    else:
+        print(f"\n❌ SCENARIO 5 FAILED:")
+        if not gridmap_A_not_versioned:
+            print(f"   - Source tree was versioned (should NOT be)")
+        if not gridmap_B_versioned:
+            print(f"   - Target tree not versioned (should be)")
+        return False
+
+
+def test_scenario_6_within_tree_partial_output():
+    """
+    SCENARIO 6: Within-tree partial output
+    
+    Move agent within same tree, only return one node.
+    Expected: Full tree versioned, modifications visible in non-returned nodes.
+    """
+    print("\n" + "="*70)
+    print("SCENARIO 6: Within-tree partial output")
+    print("="*70)
+    
+    # Create gridmap with two nodes
+    gridmap = GridMap(
+        nodes=[
+            Node(agents=[Agent(name="agent1")]),
+            Node(agents=[])
+        ]
+    )
+    gridmap.promote_to_root()
+    
+    original_gridmap_id = gridmap.ecs_id
+    
+    print(f"\nBEFORE:")
+    print(f"  GridMap: {original_gridmap_id}")
+    print(f"  Agents in nodes[0]: {len(gridmap.nodes[0].agents)}")
+    print(f"  Agents in nodes[1]: {len(gridmap.nodes[1].agents)}")
+    
+    # Execute - only returns target node (nodes[1])
+    result = CallableRegistry.execute(
+        "move_agent_within_tree_return_one",
+        preserve_tree_structure=True,
+        gridmap=gridmap,
+        source_idx=0,
+        target_idx=1,
+        agent=gridmap.nodes[0].agents[0]
+    )
+    
+    print(f"\nAFTER:")
+    print(f"  Result.root_ecs_id: {result.root_ecs_id}")
+    print(f"  Agents in result: {len(result.agents)}")
+    
+    # Fetch the versioned gridmap
+    stored_gridmap = EntityRegistry.get_stored_entity(result.root_ecs_id, result.root_ecs_id)
+    
+    print(f"\n  Stored GridMap:")
+    if stored_gridmap:
+        print(f"    ecs_id: {stored_gridmap.ecs_id}")
+        print(f"    Different from original: {stored_gridmap.ecs_id != original_gridmap_id}")
+        print(f"    Agents in nodes[0] (source, not returned): {len(stored_gridmap.nodes[0].agents)}")
+        print(f"    Agents in nodes[1] (target, returned): {len(stored_gridmap.nodes[1].agents)}")
+        
+        tree_versioned = (stored_gridmap.ecs_id != original_gridmap_id)
+        source_modified = (len(stored_gridmap.nodes[0].agents) == 0)
+        target_modified = (len(stored_gridmap.nodes[1].agents) == 1)
+        all_correct = tree_versioned and source_modified and target_modified
+    else:
+        all_correct = False
+    
+    if all_correct:
+        print(f"\n✅ SCENARIO 6 PASSED: Within-tree modifications visible")
+        print(f"   - Tree versioned")
+        print(f"   - Source node modified (not returned)")
+        print(f"   - Target node modified (returned)")
+        return True
+    else:
+        print(f"\n❌ SCENARIO 6 FAILED")
+        return False
+
+
 def main():
     print("\n" + "="*70)
     print("TREE STRUCTURE PRESERVATION TEST SUITE")
     print("="*70)
     print("\nThis test identifies problems with tree structure preservation")
-    print("in transactional execution across 5 scenarios.")
+    print("in transactional execution across 7 scenarios.")
     
     results = []
     
@@ -567,6 +745,8 @@ def main():
     results.append(("Scenario 3: Local with reattachment", test_scenario_3_local_with_reattachment()))
     results.append(("Scenario 3B: Cross-tree movement", test_scenario_3b_cross_tree_movement()))
     results.append(("Scenario 4: Pure local processing", test_scenario_4_pure_local()))
+    results.append(("Scenario 5: Output filtering", test_scenario_5_output_filtering()))
+    results.append(("Scenario 6: Within-tree partial output", test_scenario_6_within_tree_partial_output()))
     
     # Summary
     print("\n" + "="*70)

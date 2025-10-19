@@ -1207,13 +1207,18 @@ def update_tree_mappings_after_versioning(tree: EntityTree, id_mapping: Dict[UUI
         tree: The EntityTree to update
         id_mapping: Maps old_ecs_id -> new_ecs_id for all updated entities
     """
+    import time
     
     # Step 1: Update nodes mapping
+    t1 = time.perf_counter()
     updated_nodes = {}
     for old_ecs_id, entity in tree.nodes.items():
         new_ecs_id = id_mapping.get(old_ecs_id, old_ecs_id)
         updated_nodes[new_ecs_id] = entity
     tree.nodes = updated_nodes
+    t1_time = (time.perf_counter() - t1) * 1000
+    if t1_time > 3 and len(id_mapping) > 50:
+        print(f"        UPDATE_NODES: {t1_time:.1f}ms ({len(id_mapping)} mappings)")
     
     # Step 2: Update edges mapping and edge object IDs
     updated_edges = {}
@@ -1629,7 +1634,12 @@ class EntityRegistry():
             cls.register_entity(entity)
             return True
         else:
+            import time
+            t_build = time.perf_counter()
             new_tree = build_entity_tree(entity)
+            build_time = (time.perf_counter() - t_build) * 1000
+            if build_time > 5:
+                print(f"      BUILD_TREE: {build_time:.1f}ms")
             if force_versioning:
                 modified_entities = new_tree.nodes.keys()
             else:
@@ -1661,6 +1671,7 @@ class EntityRegistry():
                 # now we fork all the modified entities with the new root_ecs_id as input
                 #remove the old root_ecs_id from the typed_entities
                 typed_entities.remove(current_root_ecs_id)
+                t_update_ids = time.perf_counter()
                 for modified_entity_id in typed_entities:
                     modified_entity = new_tree.get_entity(modified_entity_id)
                     if modified_entity is not None:
@@ -1672,14 +1683,25 @@ class EntityRegistry():
                     else:
                         #later here we will handle the case where the entity has been moved to a different tree or prompoted to it's own tree
                         print(f"modified entity {modified_entity_id} not found in new tree, something went wrong")
+                update_ids_time = (time.perf_counter() - t_update_ids) * 1000
+                if update_ids_time > 5:
+                    print(f"      UPDATE_IDS: {update_ids_time:.1f}ms ({len(typed_entities)} entities)")
                 
                 # Update tree mappings to be consistent with new ECS IDs
+                t_update_map = time.perf_counter()
                 update_tree_mappings_after_versioning(new_tree, id_mapping)
+                update_map_time = (time.perf_counter() - t_update_map) * 1000
+                if update_map_time > 5:
+                    print(f"      UPDATE_MAPPINGS: {update_map_time:.1f}ms")
                 
                 # Update the tree's lineage_id to match the updated root entity
                 new_tree.lineage_id = root_entity.lineage_id
                 
+                t_register = time.perf_counter()
                 cls.register_entity_tree(new_tree)
+                register_time = (time.perf_counter() - t_register) * 1000
+                if register_time > 5:
+                    print(f"      REGISTER_TREE: {register_time:.1f}ms")
             return True            
 
 
