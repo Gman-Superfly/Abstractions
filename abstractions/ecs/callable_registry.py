@@ -28,6 +28,63 @@ from abstractions.ecs.functional_api import create_composite_entity, resolve_dat
 from abstractions.ecs.return_type_analyzer import ReturnTypeAnalyzer, QuickPatternDetector
 from abstractions.ecs.entity_unpacker import EntityUnpacker, ContainerReconstructor
 import concurrent.futures
+from collections import defaultdict
+import threading
+
+# Performance timing instrumentation
+class PerformanceTimer:
+    """Thread-safe performance timing aggregator."""
+    def __init__(self):
+        self._timings = defaultdict(list)
+        self._lock = threading.Lock()
+    
+    def record(self, label: str, duration_ms: float):
+        with self._lock:
+            self._timings[label].append(duration_ms)
+    
+    def get_stats(self) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            stats = {}
+            for label, times in self._timings.items():
+                if times:
+                    stats[label] = {
+                        'count': len(times),
+                        'total': sum(times),
+                        'mean': sum(times) / len(times),
+                        'min': min(times),
+                        'max': max(times)
+                    }
+            return stats
+    
+    def reset(self):
+        with self._lock:
+            self._timings.clear()
+    
+    def print_stats(self):
+        stats = self.get_stats()
+        if not stats:
+            print("No timing data collected")
+            return
+        
+        print("\n" + "="*70)
+        print("CALLABLE REGISTRY PERFORMANCE BREAKDOWN")
+        print("="*70)
+        print(f"{'Operation':<40} {'Count':>6} {'Total(ms)':>10} {'Mean(ms)':>10}")
+        print("-"*70)
+        
+        # Sort by total time descending
+        sorted_stats = sorted(stats.items(), key=lambda x: x[1]['total'], reverse=True)
+        
+        for label, data in sorted_stats:
+            print(f"{label:<40} {data['count']:>6} {data['total']:>10.2f} {data['mean']:>10.3f}")
+        
+        print("="*70)
+        total_time = sum(s['total'] for s in stats.values())
+        print(f"{'TOTAL':<40} {'':<6} {total_time:>10.2f}")
+        print("="*70 + "\n")
+
+# Global timer instance
+_perf_timer = PerformanceTimer()
 
 def extract_entity_uuids(kwargs: Dict[str, Any]) -> Tuple[List[UUID], List[str]]:
     """Extract UUIDs and types from kwargs for event tracking."""
@@ -582,12 +639,16 @@ class CallableRegistry:
             **kwargs: Function arguments
         """
         # Step 1: Get function metadata
+        t0 = time.perf_counter()
         metadata = cls.get_metadata(func_name)
         if not metadata:
             raise ValueError(f"Function '{func_name}' not registered")
+        _perf_timer.record("1_get_metadata", (time.perf_counter() - t0) * 1000)
         
         # Step 2: Detect execution strategy based on ConfigEntity pattern
+        t0 = time.perf_counter()
         strategy = cls._detect_execution_strategy(kwargs, metadata)
+        _perf_timer.record("2_detect_strategy", (time.perf_counter() - t0) * 1000)
         
         # Step 3: Route to appropriate execution strategy
         if strategy == "single_entity_with_config":
@@ -596,13 +657,17 @@ class CallableRegistry:
             return await cls._execute_no_inputs(metadata)
         elif strategy in ["multi_entity_composite", "single_entity_direct"]:
             # Use pattern classification for existing logic
+            t0 = time.perf_counter()
             pattern_type, classification = InputPatternClassifier.classify_kwargs(kwargs)
+            _perf_timer.record("3_classify_pattern", (time.perf_counter() - t0) * 1000)
             if pattern_type in ["pure_transactional", "mixed"]:
                 return await cls._execute_transactional(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
             else:
                 return await cls._execute_borrowing(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
         else:  # pure_borrowing
+            t0 = time.perf_counter()
             pattern_type, classification = InputPatternClassifier.classify_kwargs(kwargs)
+            _perf_timer.record("3_classify_pattern", (time.perf_counter() - t0) * 1000)
             return await cls._execute_borrowing(metadata, kwargs, classification, skip_divergence_check=skip_divergence_check)
     
     @classmethod
@@ -959,30 +1024,6 @@ class CallableRegistry:
             return output_entity
     
     @classmethod
-    @emit_events(
-        creating_factory=lambda cls, metadata, kwargs, classification: TransactionalExecutionEvent(
-            process_name="transactional_execution",
-            function_name=metadata.name,
-            isolated_entity_ids=extract_entity_uuids(kwargs)[0],
-            execution_copy_ids=[],  # Will be populated during execution
-            isolated_entities_count=len([v for v in kwargs.values() if isinstance(v, Entity)]),
-            has_object_identity_map=True,
-            isolation_successful=True,
-            transaction_id=uuid4()
-        ),
-        created_factory=lambda result, cls, metadata, kwargs, classification: TransactionalExecutedEvent(
-            process_name="transactional_execution",
-            function_name=metadata.name,
-            execution_successful=True,
-            isolated_entity_ids=extract_entity_uuids(kwargs)[0],
-            output_entity_ids=[result.ecs_id] if isinstance(result, Entity) else [e.ecs_id for e in result] if isinstance(result, list) else [],
-            execution_copy_ids=[],  # Will be populated during execution
-            output_entities_count=1 if isinstance(result, Entity) else len(result) if isinstance(result, list) else 0,
-            semantic_analysis_completed=True,
-            transaction_duration_ms=0.0,
-            transaction_id=uuid4()
-        )
-    )
     async def _execute_transactional(cls, metadata: FunctionMetadata, kwargs: Dict[str, Any], classification: Optional[Dict[str, str]] = None, skip_divergence_check: bool = False) -> Union[Entity, List[Entity]]:
         """
         Enhanced execute with complete semantic detection and Phase 2 unpacking.
@@ -998,34 +1039,44 @@ class CallableRegistry:
         start_time = time.time()
         
         # Step 1: Prepare isolated execution environment with object identity tracking
+        t0 = time.perf_counter()
         execution_kwargs, original_entities, execution_copies, object_identity_map = await cls._prepare_transactional_inputs(kwargs, skip_divergence_check)
+        _perf_timer.record("4_prepare_inputs", (time.perf_counter() - t0) * 1000)
         
         # Extract input entity for tracking (first original entity if available)
         input_entity = original_entities[0] if original_entities else None
         
         # Step 2: Execute function with isolated entities
+        t0 = time.perf_counter()
         try:
             if metadata.is_async:
                 result = await metadata.original_function(**execution_kwargs)
             else:
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(None, lambda: metadata.original_function(**execution_kwargs))
+        finally:
+            _perf_timer.record("5_execute_function", (time.perf_counter() - t0) * 1000)
+        
+        # Step 3: Enhanced finalization with Phase 2 unpacking
+        t0 = time.perf_counter()
+        try:
+            is_multi_entity = (metadata.expected_output_count > 1 or 
+                              metadata.output_pattern in ['list_return', 'tuple_return', 'dict_return', 'non_entity'])
+            if is_multi_entity:
+                # Use multi-entity result processing for multi-entity returns
+                result = await cls._finalize_multi_entity_result(
+                    result, metadata, object_identity_map, input_entity, execution_id
+                )
+            else:
+                # Use single-entity result processing for single-entity returns
+                result = await cls._finalize_single_entity_result(result, metadata, object_identity_map, execution_id)
+            
+            _perf_timer.record("6_finalize_result", (time.perf_counter() - t0) * 1000)
+            return result
         except Exception as e:
             execution_duration = time.time() - start_time
             await cls._record_execution_failure(input_entity, metadata.name, str(e), execution_id, execution_duration)
             raise
-        
-        # Step 3: Enhanced finalization with Phase 2 unpacking
-        is_multi_entity = (metadata.expected_output_count > 1 or 
-                          metadata.output_pattern in ['list_return', 'tuple_return', 'dict_return', 'non_entity'])
-        if is_multi_entity:
-            # Use multi-entity result processing for multi-entity returns
-            return await cls._finalize_multi_entity_result(
-                result, metadata, object_identity_map, input_entity, execution_id
-            )
-        else:
-            # Use single-entity result processing for single-entity returns
-            return await cls._finalize_single_entity_result(result, metadata, object_identity_map, execution_id)
     
     @classmethod
     async def _prepare_transactional_inputs(cls, kwargs: Dict[str, Any], skip_divergence_check: bool = False) -> Tuple[Dict[str, Any], List[Entity], List[Entity], Dict[int, Entity]]:
@@ -1050,10 +1101,6 @@ class CallableRegistry:
                 original_entities.append(value)
                 
                 # Create isolated execution copy
-                # Entity is either:
-                # 1. Fresh from divergence check (if not skipped), OR
-                # 2. Trusted by caller (if skipped)
-                # So we can safely copy directly without fetching from storage
                 copy = value.model_copy(deep=True)
                 copy.live_id = uuid4()
                 
@@ -1173,12 +1220,16 @@ class CallableRegistry:
             if execution_id is None:
                 execution_id = uuid4()
             
+            t0 = time.perf_counter()
             semantic, original_entity = cls._detect_execution_semantic(result, object_identity_map)
+            _perf_timer.record("7_detect_semantic", (time.perf_counter() - t0) * 1000)
             
             # Call _apply_semantic_actions to set tracking fields and handle semantics
+            t0 = time.perf_counter()
             result = await cls._apply_semantic_actions(
                 result, semantic, original_entity, metadata, execution_id
             )
+            _perf_timer.record("8_apply_semantic", (time.perf_counter() - t0) * 1000)
             
             return result
         
@@ -1298,7 +1349,9 @@ class CallableRegistry:
             if original_entity:
                 # FIX: Version BEFORE update_ecs_ids so we can compare against the correct old tree
                 # version_entity will handle updating IDs for modified entities internally
+                t0 = time.perf_counter()
                 EntityRegistry.version_entity(entity)
+                _perf_timer.record("9_version_entity", (time.perf_counter() - t0) * 1000)
             else:
                 # Fallback: treat as creation if we can't find original
                 if not entity.is_root_entity():

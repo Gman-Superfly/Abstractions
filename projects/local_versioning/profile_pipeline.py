@@ -24,7 +24,7 @@ abstractions_path = Path(__file__).parent.parent.parent / "abstractions"
 sys.path.insert(0, str(abstractions_path))
 
 from abstractions.ecs.entity import Entity, EntityRegistry, build_entity_tree, find_modified_entities
-from abstractions.ecs.callable_registry import CallableRegistry
+from abstractions.ecs.callable_registry import CallableRegistry, _perf_timer
 from test_scenario import GridMap, Node, Agent, create_test_scenario
 
 
@@ -352,5 +352,8 @@ if __name__ == "__main__":
     for nodes, agents in configs:
         profiler.reset()
         profile_tree_operations(nodes, agents)
+    
+    # Print CallableRegistry performance breakdown
+    _perf_timer.print_stats()
     
     print("\n✓ Profiling complete!")

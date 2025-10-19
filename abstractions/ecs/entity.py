@@ -852,6 +852,10 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -874,6 +878,10 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add entity to tree if not already present
                         if v.ecs_id not in tree.nodes:
                             tree.add_entity(v)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if v.root_ecs_id is None:
+                                v.root_ecs_id = root_entity.ecs_id
+                                v.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -896,6 +904,10 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -918,6 +930,10 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -938,6 +954,10 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                     # Add entity to tree if not already present
                     if value.ecs_id not in tree.nodes:
                         tree.add_entity(value)
+                        # Set root_ecs_id and root_live_id on child entities
+                        if value.root_ecs_id is None:
+                            value.root_ecs_id = root_entity.ecs_id
+                            value.root_live_id = root_entity.live_id
                     
                     # Add the appropriate edge type
                     process_entity_reference(
@@ -1047,16 +1067,21 @@ def find_modified_entities(
         # Trees definitely differ, continue with full diff
         pass
     else:
-        # Trees have same structure, check if root changed
-        new_root = new_tree.get_entity(new_tree.root_ecs_id)
-        old_root = old_tree.get_entity(old_tree.root_ecs_id)
+        # Same counts - check if edges are actually the same
+        new_edge_set = set(new_tree.edges.keys())
+        old_edge_set = set(old_tree.edges.keys())
         
-        if new_root and old_root and not compare_non_entity_attributes(new_root, old_root):
-            # Root unchanged and same structure - likely no changes
-            # Return empty set for fast path
-            if debug:
-                return set(), {"comparison_count": 0, "early_exit": True}
-            return set()
+        if new_edge_set == old_edge_set:
+            # Same structure, check if root changed
+            new_root = new_tree.get_entity(new_tree.root_ecs_id)
+            old_root = old_tree.get_entity(old_tree.root_ecs_id)
+            
+            if new_root and old_root and not compare_non_entity_attributes(new_root, old_root):
+                # Root unchanged and same edges - no changes
+                # Return empty set for fast path
+                if debug:
+                    return set(), {"comparison_count": 0, "early_exit": True}
+                return set()
     
     # Set to track entities that need versioning
     modified_entities = set()
