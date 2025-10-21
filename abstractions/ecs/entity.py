@@ -1445,6 +1445,20 @@ class EntityRegistry():
     ecs_id_to_root_id: Dict[UUID, UUID] = {}
     type_registry: Dict[Type["Entity"], List[UUID]] = {}
     
+    # Profiling accumulators
+    _total_live_id_time: float = 0.0
+    _total_ecs_id_time: float = 0.0
+    _total_entities_registered: int = 0
+    _registration_count: int = 0
+    
+    # Version timing accumulators
+    _total_build_time: float = 0.0
+    _total_diff_time: float = 0.0
+    _total_update_ids_time: float = 0.0
+    _total_update_mappings_time: float = 0.0
+    _total_register_time: float = 0.0
+    _version_count: int = 0
+    
     @classmethod
     def register_entity_tree(cls, entity_tree: EntityTree) -> None:
         """ Register an entity tree in the registry when an entity tree is registered in the tree registry its
@@ -1452,17 +1466,52 @@ class EntityRegistry():
         2) the entities in the tree are referenced by their live id in the live_id_registry 
         3) the tree is added to the tree_registry with its root_ecs_id as key
         """
+        import time
+        
         if entity_tree.root_ecs_id in cls.tree_registry:
             raise ValueError("entity tree already registered")
         
+        t_tree_reg = time.perf_counter()
         cls.tree_registry[entity_tree.root_ecs_id] = entity_tree
+        tree_reg_time = (time.perf_counter() - t_tree_reg) * 1000
+        
+        t_entity_reg = time.perf_counter()
+        entity_count = len(entity_tree.nodes)
+        
+        # Separate timing for the two dict insertions
+        live_id_time = 0
+        ecs_id_time = 0
+        
         for sub_entity in entity_tree.nodes.values():
+            t1 = time.perf_counter()
             cls.live_id_registry[sub_entity.live_id] = sub_entity
+            live_id_time += (time.perf_counter() - t1)
+            
+            t2 = time.perf_counter()
             cls.ecs_id_to_root_id[sub_entity.ecs_id] = entity_tree.root_ecs_id
+            ecs_id_time += (time.perf_counter() - t2)
+        
+        entity_reg_time = (time.perf_counter() - t_entity_reg) * 1000
+        live_id_time_ms = live_id_time * 1000
+        ecs_id_time_ms = ecs_id_time * 1000
+        
+        # Accumulate profiling stats
+        cls._total_live_id_time += live_id_time_ms
+        cls._total_ecs_id_time += ecs_id_time_ms
+        cls._total_entities_registered += entity_count
+        cls._registration_count += 1
+        
+        # Calculate stats
+        registry_size = len(cls.live_id_registry)
+        
+        t_lineage = time.perf_counter()
         if entity_tree.lineage_id not in cls.lineage_registry:
             cls.lineage_registry[entity_tree.lineage_id] = [entity_tree.root_ecs_id]
         else:
             cls.lineage_registry[entity_tree.lineage_id].append(entity_tree.root_ecs_id)
+        lineage_time = (time.perf_counter() - t_lineage) * 1000
+        
+        t_type = time.perf_counter()
         root_entity = entity_tree.get_entity(entity_tree.root_ecs_id)
         if root_entity is not None:
             if root_entity.__class__ not in cls.type_registry:
@@ -1471,7 +1520,53 @@ class EntityRegistry():
                 cls.type_registry[root_entity.__class__].append(entity_tree.lineage_id)
         else:
             raise ValueError("root entity not found in entity tree")
-
+        type_time = (time.perf_counter() - t_type) * 1000
+        
+        # Don't print per-operation, we'll print accumulated stats
+        
+    @classmethod
+    def print_profiling_stats(cls):
+        """Print accumulated profiling statistics"""
+        if cls._version_count == 0:
+            print("No profiling data collected")
+            return
+        
+        print("\n" + "="*70)
+        print("VERSION_ENTITY PROFILING BREAKDOWN")
+        print("="*70)
+        print(f"Total version_entity calls: {cls._version_count}")
+        print(f"\nTime breakdown:")
+        total_version_time = (cls._total_build_time + cls._total_diff_time + cls._total_update_ids_time + 
+                             cls._total_update_mappings_time + cls._total_register_time)
+        
+        print(f"  BUILD_TREE:        {cls._total_build_time:>10.2f}ms ({cls._total_build_time/total_version_time*100:>5.1f}%)")
+        print(f"  DIFF:              {cls._total_diff_time:>10.2f}ms ({cls._total_diff_time/total_version_time*100:>5.1f}%)")
+        print(f"  UPDATE_IDS:        {cls._total_update_ids_time:>10.2f}ms ({cls._total_update_ids_time/total_version_time*100:>5.1f}%)")
+        print(f"  UPDATE_MAPPINGS:   {cls._total_update_mappings_time:>10.2f}ms ({cls._total_update_mappings_time/total_version_time*100:>5.1f}%)")
+        print(f"  REGISTER_TREE:     {cls._total_register_time:>10.2f}ms ({cls._total_register_time/total_version_time*100:>5.1f}%)")
+        print(f"  {'─'*40}")
+        print(f"  TOTAL:             {total_version_time:>10.2f}ms")
+        
+        print(f"\nDict insertion times (part of REGISTER_TREE):")
+        print(f"  live_id_registry:  {cls._total_live_id_time:>10.2f}ms")
+        print(f"  ecs_id_to_root_id: {cls._total_ecs_id_time:>10.2f}ms")
+        
+        print(f"\nFinal registry size: {len(cls.live_id_registry)} entities")
+        print("="*70 + "\n")
+    
+    @classmethod
+    def reset_profiling_stats(cls):
+        """Reset profiling accumulators"""
+        cls._total_live_id_time = 0.0
+        cls._total_ecs_id_time = 0.0
+        cls._total_entities_registered = 0
+        cls._registration_count = 0
+        cls._total_build_time = 0.0
+        cls._total_diff_time = 0.0
+        cls._total_update_ids_time = 0.0
+        cls._total_update_mappings_time = 0.0
+        cls._total_register_time = 0.0
+        cls._version_count = 0
 
     @classmethod
     @emit_events(
@@ -1635,15 +1730,23 @@ class EntityRegistry():
             return True
         else:
             import time
+            
+            # Track total version time breakdown
+            breakdown_start = time.perf_counter()
+            
             t_build = time.perf_counter()
             new_tree = build_entity_tree(entity)
             build_time = (time.perf_counter() - t_build) * 1000
-            if build_time > 5:
-                print(f"      BUILD_TREE: {build_time:.1f}ms")
+            
+            t_diff = time.perf_counter()
             if force_versioning:
                 modified_entities = new_tree.nodes.keys()
             else:
                 modified_entities = list(find_modified_entities(new_tree=new_tree, old_tree=old_tree))
+            diff_time = (time.perf_counter() - t_diff) * 1000
+            
+            # Explicitly delete old_tree to help GC - it's no longer needed
+            del old_tree
         
             typed_entities = [entity for entity in modified_entities if isinstance(entity, UUID)]
             
@@ -1672,7 +1775,10 @@ class EntityRegistry():
                 #remove the old root_ecs_id from the typed_entities
                 typed_entities.remove(current_root_ecs_id)
                 t_update_ids = time.perf_counter()
-                for modified_entity_id in typed_entities:
+                
+                # Track if loop itself is slow or if individual operations accumulate
+                loop_entry_count = len(typed_entities)
+                for idx, modified_entity_id in enumerate(typed_entities):
                     modified_entity = new_tree.get_entity(modified_entity_id)
                     if modified_entity is not None:
                         #here we could have some modified entitiyes being entities that have been removed from the tree so we get nones
@@ -1683,9 +1789,11 @@ class EntityRegistry():
                     else:
                         #later here we will handle the case where the entity has been moved to a different tree or prompoted to it's own tree
                         print(f"modified entity {modified_entity_id} not found in new tree, something went wrong")
+                
                 update_ids_time = (time.perf_counter() - t_update_ids) * 1000
                 if update_ids_time > 5:
-                    print(f"      UPDATE_IDS: {update_ids_time:.1f}ms ({len(typed_entities)} entities)")
+                    avg_per_entity = update_ids_time / loop_entry_count if loop_entry_count > 0 else 0
+                    print(f"      UPDATE_IDS: {update_ids_time:.1f}ms ({loop_entry_count} entities, {avg_per_entity:.3f}ms/entity)")
                 
                 # Update tree mappings to be consistent with new ECS IDs
                 t_update_map = time.perf_counter()
@@ -1700,8 +1808,15 @@ class EntityRegistry():
                 t_register = time.perf_counter()
                 cls.register_entity_tree(new_tree)
                 register_time = (time.perf_counter() - t_register) * 1000
-                if register_time > 5:
-                    print(f"      REGISTER_TREE: {register_time:.1f}ms")
+                
+                # Accumulate timing stats
+                cls._total_build_time += build_time
+                cls._total_diff_time += diff_time
+                cls._total_update_ids_time += update_ids_time
+                cls._total_update_mappings_time += update_map_time
+                cls._total_register_time += register_time
+                cls._version_count += 1
+                
             return True            
 
 

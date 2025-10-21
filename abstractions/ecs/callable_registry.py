@@ -411,6 +411,12 @@ class CallableRegistry:
     
     _functions: Dict[str, FunctionMetadata] = {}
     
+    # Detailed overhead profiling accumulators
+    _total_input_copy_time: float = 0.0
+    _total_function_exec_time: float = 0.0
+    _total_semantic_time: float = 0.0
+    _call_count: int = 0
+    
     # Clear cache on startup to ensure consistent 3-tuple format
     @classmethod
     def _ensure_cache_consistency(cls):
@@ -1055,7 +1061,7 @@ class CallableRegistry:
         input_entity = original_entities[0] if original_entities else None
         
         # Step 2: Execute function with isolated entities
-        t0 = time.perf_counter()
+        t_func = time.perf_counter()
         try:
             if metadata.is_async:
                 result = await metadata.original_function(**execution_kwargs)
@@ -1063,7 +1069,9 @@ class CallableRegistry:
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(None, lambda: metadata.original_function(**execution_kwargs))
         finally:
-            _perf_timer.record("5_execute_function", (time.perf_counter() - t0) * 1000)
+            func_time = (time.perf_counter() - t_func) * 1000
+            _perf_timer.record("5_execute_function", func_time)
+            cls._total_function_exec_time += func_time
         
         # Step 3: Enhanced finalization with Phase 2 unpacking
         t0 = time.perf_counter()
@@ -1145,7 +1153,7 @@ class CallableRegistry:
                 # Ensure it's promoted to root
                 if not root_copy.is_root_entity():
                     root_copy.promote_to_root()
-                # Version the tree - let diff algorithm detect what changed
+                # Version the tree - use diff algorithm
                 version_start = time.perf_counter()
                 EntityRegistry.version_entity(root_copy, force_versioning=False)
                 version_time = (time.perf_counter() - version_start) * 1000
@@ -1255,8 +1263,10 @@ class CallableRegistry:
                     original_entities.append(value)
                     
                     # Create isolated execution copy
+                    t_copy = time.perf_counter()
                     copy = value.model_copy(deep=True)
                     copy.live_id = uuid4()
+                    cls._total_input_copy_time += (time.perf_counter() - t_copy) * 1000
                     
                     execution_copies.append(copy)
                     execution_kwargs[param_name] = copy
@@ -1379,11 +1389,14 @@ class CallableRegistry:
             _perf_timer.record("7_detect_semantic", (time.perf_counter() - t0) * 1000)
             
             # Call _apply_semantic_actions to set tracking fields and handle semantics
-            t0 = time.perf_counter()
+            t_semantic = time.perf_counter()
             result = await cls._apply_semantic_actions(
                 result, semantic, original_entity, metadata, execution_id
             )
-            _perf_timer.record("8_apply_semantic", (time.perf_counter() - t0) * 1000)
+            semantic_time = (time.perf_counter() - t_semantic) * 1000
+            _perf_timer.record("8_apply_semantic", semantic_time)
+            cls._total_semantic_time += semantic_time
+            cls._call_count += 1
             
             return result
         
@@ -1503,12 +1516,10 @@ class CallableRegistry:
             if original_entity:
                 # FIX: Version BEFORE update_ecs_ids so we can compare against the correct old tree
                 # version_entity will handle updating IDs for modified entities internally
-                t0 = time.perf_counter()
-                EntityRegistry.version_entity(entity)
-                version_time = (time.perf_counter() - t0) * 1000
+                t_version = time.perf_counter()
+                EntityRegistry.version_entity(entity, force_versioning=False)  # Use diff algorithm (force_versioning=False by default)
+                version_time = (time.perf_counter() - t_version) * 1000
                 _perf_timer.record("9_version_entity", version_time)
-                if version_time > 10:
-                    print(f"    GLOBAL VERSION TIME: {version_time:.1f}ms (registry_size={len(EntityRegistry.tree_registry)})")
             else:
                 # Fallback: treat as creation if we can't find original
                 if not entity.is_root_entity():
