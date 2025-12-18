@@ -168,7 +168,10 @@ def math_reward_fn(prompts, responses):
 - **GPU Utilization**: Mixed precision and efficient tensor ops
 - **Convergence**: Length normalization stabilizes training vs. GRPO
 
-## Future Enhancements
+## Future Enhancements 
+
+[note] HF already has GSPO Planned, 
+this is the crazy stuff claude thinks up which I like to keep as half of it is useful, some is meh fantasy and half is usually obvious to others working in the field, not obvious to me LOL
 
 1. **GSPO-token**: Implement token-level variant for multi-turn RL
 2. **Distributed Training**: Support for multi-GPU setups
@@ -191,4 +194,4 @@ The algorithm shows particular promise for:
 
 ---
 
-**Note**: This is currently the **only open-source GSPO implementation** available, as the paper was just published (July 25, 2025) and no official code has been released yet. 
+**Note**: the paper was just published (July 25, 2025) and no official code has been released yet. 
