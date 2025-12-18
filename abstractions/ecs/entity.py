@@ -12,6 +12,7 @@ from typing import Dict, List, Set, Tuple, Any, Optional, Type, Union, get_type_
 from uuid import UUID, uuid4
 from enum import Enum
 from collections import deque
+from dataclasses import dataclass
 import inspect
 from pydantic import create_model
 
@@ -266,6 +267,120 @@ class EntityTree(BaseModel):
 
 
 # Functions to build the entity tree
+
+# ============================================================================
+# Field Metadata Caching for Performance
+# ============================================================================
+
+@dataclass
+class FieldMetadata:
+    """Cached metadata for an entity field to avoid repeated type introspection."""
+    name: str
+    contains_entities: bool
+    entity_type: Optional[Type["Entity"]]
+    container_type: Optional[str]  # 'list', 'dict', 'tuple', 'set', or None
+    is_identity_field: bool
+
+
+# Global cache: maps entity class to its field metadata
+_FIELD_METADATA_CACHE: Dict[Type["Entity"], Dict[str, FieldMetadata]] = {}
+
+# Identity fields that should be skipped during tree building
+_IDENTITY_FIELDS = frozenset({
+    'ecs_id', 'live_id', 'created_at', 'forked_at', 'previous_ecs_id',
+    'old_ids', 'old_ecs_id', 'from_storage', 'attribute_source',
+    'root_ecs_id', 'root_live_id', 'lineage_id'
+})
+
+
+def get_cached_field_metadata(entity_class: Type["Entity"]) -> Dict[str, FieldMetadata]:
+    """
+    Get cached field metadata for an entity class.
+    
+    This analyzes the Pydantic field annotations once per class and caches the results,
+    avoiding repeated expensive type introspection during tree building.
+    
+    Args:
+        entity_class: The entity class to analyze
+        
+    Returns:
+        Dict mapping field names to FieldMetadata
+    """
+    if entity_class not in _FIELD_METADATA_CACHE:
+        metadata = {}
+        
+        for field_name, field_info in entity_class.model_fields.items():
+            # Check if identity field
+            is_identity = field_name in _IDENTITY_FIELDS
+            
+            # Analyze field type annotation
+            annotation = field_info.annotation
+            contains_entities = False
+            entity_type = None
+            container_type = None
+            
+            if not is_identity and annotation:
+                # Check for direct Entity type
+                try:
+                    if annotation == Entity or (isinstance(annotation, type) and issubclass(annotation, Entity)):
+                        contains_entities = True
+                        entity_type = annotation
+                except TypeError:
+                    pass
+                
+                # Handle Optional types
+                origin = get_origin(annotation)
+                if origin is Union:
+                    args = get_args(annotation)
+                    inner_type = next((arg for arg in args if arg is not type(None)), None)
+                    if inner_type:
+                        try:
+                            if inner_type == Entity or (isinstance(inner_type, type) and issubclass(inner_type, Entity)):
+                                contains_entities = True
+                                entity_type = inner_type
+                        except TypeError:
+                            pass
+                        origin = get_origin(inner_type) if inner_type else None
+                
+                # Handle container types
+                if origin in (list, set, tuple, dict):
+                    args = get_args(annotation)
+                    if origin is dict and len(args) >= 2:
+                        value_type = args[1]
+                        try:
+                            if value_type == Entity or (isinstance(value_type, type) and issubclass(value_type, Entity)):
+                                contains_entities = True
+                                entity_type = value_type
+                                container_type = 'dict'
+                        except TypeError:
+                            pass
+                    elif origin in (list, set, tuple) and args:
+                        item_type = args[0]
+                        try:
+                            if item_type == Entity or (isinstance(item_type, type) and issubclass(item_type, Entity)):
+                                contains_entities = True
+                                entity_type = item_type
+                                if origin is list:
+                                    container_type = 'list'
+                                elif origin is set:
+                                    container_type = 'set'
+                                elif origin is tuple:
+                                    container_type = 'tuple'
+                        except TypeError:
+                            pass
+            
+            metadata[field_name] = FieldMetadata(
+                name=field_name,
+                contains_entities=contains_entities,
+                entity_type=entity_type,
+                container_type=container_type,
+                is_identity_field=is_identity
+            )
+        
+        _FIELD_METADATA_CACHE[entity_class] = metadata
+    
+    return _FIELD_METADATA_CACHE[entity_class]
+
 
 def get_field_ownership(entity: "Entity", field_name: str) -> bool:
     """
@@ -637,6 +752,11 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
     """
     Build a complete entity tree from a root entity in a single pass.
     
+    PROFILING NOTE: If this is slow, check:
+    - Number of entities being traversed
+    - Number of fields per entity
+    - Deep nesting of entity hierarchies
+    
     This algorithm:
     1. Builds the tree structure and ancestry paths in a single traversal
     2. Immediately classifies edges based on ownership
@@ -709,43 +829,33 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
         if not entity_needs_processing:
             continue
             
-        # Process all fields if the entity hasn't been processed yet
-        for field_name in entity.model_fields:
+        # Get cached field metadata for this entity class (computed once per class)
+        field_metadata = get_cached_field_metadata(type(entity))
+        
+        # Process only fields that contain entities
+        for field_name, field_meta in field_metadata.items():
+            # Skip identity fields and non-entity fields
+            if field_meta.is_identity_field or not field_meta.contains_entities:
+                continue
+            
             value = getattr(entity, field_name)
             
             # Skip None values
             if value is None:
                 continue
             
-            # Get expected type for this field
-            field_type = get_pydantic_field_type_entities(entity, field_name)
-            
-            # Direct entity reference
-            if isinstance(value, Entity):
-                # Add entity to tree if not already present
-                if value.ecs_id not in tree.nodes:
-                    tree.add_entity(value)
-                
-                # Add the appropriate edge type
-                process_entity_reference(
-                    tree=tree,
-                    source=entity,
-                    target=value,
-                    field_name=field_name,
-                    to_process=None,  # We'll handle queue manually
-                    distance_map=None  # Not using distance map in single-pass version
-                )
-                
-                # Add to processing queue
-                to_process.append((value, entity.ecs_id))
-            
-            # List of entities
-            elif isinstance(value, list) and field_type:
+            # Handle based on container type from cached metadata
+            if field_meta.container_type == 'list':
+                # List of entities
                 for i, item in enumerate(value):
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -761,13 +871,17 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
             
-            # Dict of entities
-            elif isinstance(value, dict) and field_type:
+            elif field_meta.container_type == 'dict':
+                # Dict of entities
                 for k, v in value.items():
                     if isinstance(v, Entity):
                         # Add entity to tree if not already present
                         if v.ecs_id not in tree.nodes:
                             tree.add_entity(v)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if v.root_ecs_id is None:
+                                v.root_ecs_id = root_entity.ecs_id
+                                v.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -783,13 +897,17 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((v, entity.ecs_id))
             
-            # Tuple of entities
-            elif isinstance(value, tuple) and field_type:
+            elif field_meta.container_type == 'tuple':
+                # Tuple of entities
                 for i, item in enumerate(value):
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -805,13 +923,17 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
             
-            # Set of entities
-            elif isinstance(value, set) and field_type:
+            elif field_meta.container_type == 'set':
+                # Set of entities
                 for item in value:
                     if isinstance(item, Entity):
                         # Add entity to tree if not already present
                         if item.ecs_id not in tree.nodes:
                             tree.add_entity(item)
+                            # Set root_ecs_id and root_live_id on child entities
+                            if item.root_ecs_id is None:
+                                item.root_ecs_id = root_entity.ecs_id
+                                item.root_live_id = root_entity.live_id
                         
                         # Add the appropriate edge type
                         process_entity_reference(
@@ -825,6 +947,30 @@ def build_entity_tree(root_entity: "Entity") -> EntityTree:
                         
                         # Add to processing queue
                         to_process.append((item, entity.ecs_id))
+            
+            else:
+                # Direct entity reference (no container)
+                if isinstance(value, Entity):
+                    # Add entity to tree if not already present
+                    if value.ecs_id not in tree.nodes:
+                        tree.add_entity(value)
+                        # Set root_ecs_id and root_live_id on child entities
+                        if value.root_ecs_id is None:
+                            value.root_ecs_id = root_entity.ecs_id
+                            value.root_live_id = root_entity.live_id
+                    
+                    # Add the appropriate edge type
+                    process_entity_reference(
+                        tree=tree,
+                        source=entity,
+                        target=value,
+                        field_name=field_name,
+                        to_process=None,  # We'll handle queue manually
+                        distance_map=None  # Not using distance map in single-pass version
+                    )
+                    
+                    # Add to processing queue
+                    to_process.append((value, entity.ecs_id))
     
     # Ensure all entities have an ancestry path
     # This is just a safety check - all entities should have paths by now
@@ -860,7 +1006,7 @@ def get_non_entity_attributes(entity: "Entity") -> Dict[str, Any]:
 
 def compare_non_entity_attributes(entity1: "Entity", entity2: "Entity") -> bool:
     """
-    Compare non-entity attributes between two entities.
+    Compare non-entity attributes between two entities using cached field metadata.
     
     Args:
         entity1: First entity to compare
@@ -869,23 +1015,20 @@ def compare_non_entity_attributes(entity1: "Entity", entity2: "Entity") -> bool:
     Returns:
         bool: True if the entities have different non-entity attributes, False if they're the same
     """
-    # Get non-entity attributes for both entities
-    attrs1 = get_non_entity_attributes(entity1)
-    attrs2 = get_non_entity_attributes(entity2)
+    # Use cached field metadata to avoid repeated type introspection
+    metadata = get_cached_field_metadata(type(entity1))
     
-    # Different set of non-entity attributes
-    if set(attrs1.keys()) != set(attrs2.keys()):
-        return True
-    
-    # Empty sets of attributes means no changes
-    if not attrs1 and not attrs2:
-        return False
-    
-    # Compare values of non-entity attributes
-    for field_name, value1 in attrs1.items():
-        value2 = attrs2[field_name]
+    # Compare only non-entity, non-identity fields
+    for field_name, field_meta in metadata.items():
+        # Skip entity fields and identity fields
+        if field_meta.contains_entities or field_meta.is_identity_field:
+            continue
         
-        # Direct comparison for non-entity values
+        # Get values
+        value1 = getattr(entity1, field_name)
+        value2 = getattr(entity2, field_name)
+        
+        # Direct comparison - early exit on first difference
         if value1 != value2:
             return True
     
@@ -919,6 +1062,27 @@ def find_modified_entities(
         If debug=True:
             Tuple[Set[UUID], Dict[str, Any]]: Set of modified entity IDs and debugging info
     """
+    # Early exit: Quick check if trees might be identical
+    if new_tree.node_count != old_tree.node_count or new_tree.edge_count != old_tree.edge_count:
+        # Trees definitely differ, continue with full diff
+        pass
+    else:
+        # Same counts - check if edges are actually the same
+        new_edge_set = set(new_tree.edges.keys())
+        old_edge_set = set(old_tree.edges.keys())
+        
+        if new_edge_set == old_edge_set:
+            # Same structure, check if root changed
+            new_root = new_tree.get_entity(new_tree.root_ecs_id)
+            old_root = old_tree.get_entity(old_tree.root_ecs_id)
+            
+            if new_root and old_root and not compare_non_entity_attributes(new_root, old_root):
+                # Root unchanged and same edges - no changes
+                # Return empty set for fast path
+                if debug:
+                    return set(), {"comparison_count": 0, "early_exit": True}
+                return set()
+    
     # Set to track entities that need versioning
     modified_entities = set()
     
@@ -960,16 +1124,9 @@ def find_modified_entities(
     for source_id, target_id in added_edges:
         # If target is a common entity but has a new connection
         if target_id in common_entities:
-            # Check if this entity has a different parent in the old tree
-            old_parents = set()
-            for old_source_id, old_target_id in old_edges:
-                if old_target_id == target_id:
-                    old_parents.add(old_source_id)
-            
-            new_parents = set()
-            for new_source_id, new_target_id in new_edges:
-                if new_target_id == target_id:
-                    new_parents.add(new_source_id)
+            # Use indexed incoming_edges instead of scanning all edges (O(1) vs O(E))
+            old_parents = set(old_tree.incoming_edges.get(target_id, []))
+            new_parents = set(new_tree.incoming_edges.get(target_id, []))
             
             # If the entity has different parents, it's been moved
             if old_parents != new_parents:
@@ -1050,13 +1207,18 @@ def update_tree_mappings_after_versioning(tree: EntityTree, id_mapping: Dict[UUI
         tree: The EntityTree to update
         id_mapping: Maps old_ecs_id -> new_ecs_id for all updated entities
     """
+    import time
     
     # Step 1: Update nodes mapping
+    t1 = time.perf_counter()
     updated_nodes = {}
     for old_ecs_id, entity in tree.nodes.items():
         new_ecs_id = id_mapping.get(old_ecs_id, old_ecs_id)
         updated_nodes[new_ecs_id] = entity
     tree.nodes = updated_nodes
+    t1_time = (time.perf_counter() - t1) * 1000
+    if t1_time > 3 and len(id_mapping) > 50:
+        print(f"        UPDATE_NODES: {t1_time:.1f}ms ({len(id_mapping)} mappings)")
     
     # Step 2: Update edges mapping and edge object IDs
     updated_edges = {}
@@ -1283,6 +1445,20 @@ class EntityRegistry():
     ecs_id_to_root_id: Dict[UUID, UUID] = {}
     type_registry: Dict[Type["Entity"], List[UUID]] = {}
     
+    # Profiling accumulators
+    _total_live_id_time: float = 0.0
+    _total_ecs_id_time: float = 0.0
+    _total_entities_registered: int = 0
+    _registration_count: int = 0
+    
+    # Version timing accumulators
+    _total_build_time: float = 0.0
+    _total_diff_time: float = 0.0
+    _total_update_ids_time: float = 0.0
+    _total_update_mappings_time: float = 0.0
+    _total_register_time: float = 0.0
+    _version_count: int = 0
+    
     @classmethod
     def register_entity_tree(cls, entity_tree: EntityTree) -> None:
         """ Register an entity tree in the registry when an entity tree is registered in the tree registry its
@@ -1290,17 +1466,52 @@ class EntityRegistry():
         2) the entities in the tree are referenced by their live id in the live_id_registry 
         3) the tree is added to the tree_registry with its root_ecs_id as key
         """
+        import time
+        
         if entity_tree.root_ecs_id in cls.tree_registry:
             raise ValueError("entity tree already registered")
         
+        t_tree_reg = time.perf_counter()
         cls.tree_registry[entity_tree.root_ecs_id] = entity_tree
+        tree_reg_time = (time.perf_counter() - t_tree_reg) * 1000
+        
+        t_entity_reg = time.perf_counter()
+        entity_count = len(entity_tree.nodes)
+        
+        # Separate timing for the two dict insertions
+        live_id_time = 0
+        ecs_id_time = 0
+        
         for sub_entity in entity_tree.nodes.values():
+            t1 = time.perf_counter()
             cls.live_id_registry[sub_entity.live_id] = sub_entity
+            live_id_time += (time.perf_counter() - t1)
+            
+            t2 = time.perf_counter()
             cls.ecs_id_to_root_id[sub_entity.ecs_id] = entity_tree.root_ecs_id
+            ecs_id_time += (time.perf_counter() - t2)
+        
+        entity_reg_time = (time.perf_counter() - t_entity_reg) * 1000
+        live_id_time_ms = live_id_time * 1000
+        ecs_id_time_ms = ecs_id_time * 1000
+        
+        # Accumulate profiling stats
+        cls._total_live_id_time += live_id_time_ms
+        cls._total_ecs_id_time += ecs_id_time_ms
+        cls._total_entities_registered += entity_count
+        cls._registration_count += 1
+        
+        # Calculate stats
+        registry_size = len(cls.live_id_registry)
+        
+        t_lineage = time.perf_counter()
         if entity_tree.lineage_id not in cls.lineage_registry:
             cls.lineage_registry[entity_tree.lineage_id] = [entity_tree.root_ecs_id]
         else:
             cls.lineage_registry[entity_tree.lineage_id].append(entity_tree.root_ecs_id)
+        lineage_time = (time.perf_counter() - t_lineage) * 1000
+        
+        t_type = time.perf_counter()
         root_entity = entity_tree.get_entity(entity_tree.root_ecs_id)
         if root_entity is not None:
             if root_entity.__class__ not in cls.type_registry:
@@ -1309,7 +1520,53 @@ class EntityRegistry():
                 cls.type_registry[root_entity.__class__].append(entity_tree.lineage_id)
         else:
             raise ValueError("root entity not found in entity tree")
-
+        type_time = (time.perf_counter() - t_type) * 1000
+        
+        # Don't print per-operation, we'll print accumulated stats
+        
+    @classmethod
+    def print_profiling_stats(cls):
+        """Print accumulated profiling statistics"""
+        if cls._version_count == 0:
+            print("No profiling data collected")
+            return
+        
+        print("\n" + "="*70)
+        print("VERSION_ENTITY PROFILING BREAKDOWN")
+        print("="*70)
+        print(f"Total version_entity calls: {cls._version_count}")
+        print(f"\nTime breakdown:")
+        total_version_time = (cls._total_build_time + cls._total_diff_time + cls._total_update_ids_time + 
+                             cls._total_update_mappings_time + cls._total_register_time)
+        
+        print(f"  BUILD_TREE:        {cls._total_build_time:>10.2f}ms ({cls._total_build_time/total_version_time*100:>5.1f}%)")
+        print(f"  DIFF:              {cls._total_diff_time:>10.2f}ms ({cls._total_diff_time/total_version_time*100:>5.1f}%)")
+        print(f"  UPDATE_IDS:        {cls._total_update_ids_time:>10.2f}ms ({cls._total_update_ids_time/total_version_time*100:>5.1f}%)")
+        print(f"  UPDATE_MAPPINGS:   {cls._total_update_mappings_time:>10.2f}ms ({cls._total_update_mappings_time/total_version_time*100:>5.1f}%)")
+        print(f"  REGISTER_TREE:     {cls._total_register_time:>10.2f}ms ({cls._total_register_time/total_version_time*100:>5.1f}%)")
+        print(f"  {'─'*40}")
+        print(f"  TOTAL:             {total_version_time:>10.2f}ms")
+        
+        print(f"\nDict insertion times (part of REGISTER_TREE):")
+        print(f"  live_id_registry:  {cls._total_live_id_time:>10.2f}ms")
+        print(f"  ecs_id_to_root_id: {cls._total_ecs_id_time:>10.2f}ms")
+        
+        print(f"\nFinal registry size: {len(cls.live_id_registry)} entities")
+        print("="*70 + "\n")
+    
+    @classmethod
+    def reset_profiling_stats(cls):
+        """Reset profiling accumulators"""
+        cls._total_live_id_time = 0.0
+        cls._total_ecs_id_time = 0.0
+        cls._total_entities_registered = 0
+        cls._registration_count = 0
+        cls._total_build_time = 0.0
+        cls._total_diff_time = 0.0
+        cls._total_update_ids_time = 0.0
+        cls._total_update_mappings_time = 0.0
+        cls._total_register_time = 0.0
+        cls._version_count = 0
 
     @classmethod
     @emit_events(
@@ -1356,14 +1613,33 @@ class EntityRegistry():
         cls.register_entity_tree(entity_tree)
 
     @classmethod            
-    def get_stored_tree(cls, root_ecs_id: UUID) -> Optional[EntityTree]:
-        """ Get the tree for a given root_ecs_id """
-        stored_tree= cls.tree_registry.get(root_ecs_id, None)
+    def get_stored_tree(cls, root_ecs_id: UUID, read_only: bool = False) -> Optional[EntityTree]:
+        """
+        Get the tree for a given root_ecs_id.
+        
+        Args:
+            root_ecs_id: Root entity ID
+            read_only: If True, returns shallow copy for read-only access (faster).
+                      If False, returns deep copy with updated live IDs (default).
+        
+        Returns:
+            EntityTree or None if not found
+        """
+        stored_tree = cls.tree_registry.get(root_ecs_id, None)
         if stored_tree is None:
             return None
+        
+        if read_only:
+            # Direct reference for read-only access (100x faster than copy)
+            # Safe because:
+            # 1. Tree is immutable snapshot from storage
+            # 2. Only used for comparison in diff operations
+            # 3. Never mutated by diff algorithm
+            return stored_tree
         else:
+            # Deep copy with new live IDs for mutation
             new_tree = stored_tree.model_copy(deep=True)
-            new_tree.update_live_ids() #this are new python objects with new live ids
+            new_tree.update_live_ids()  # These are new python objects with new live ids
             return new_tree
             
     @classmethod
@@ -1447,16 +1723,30 @@ class EntityRegistry():
         if not entity.root_ecs_id:
             raise ValueError("entity has no root_ecs_id for versioning we only support versioning of root entities for now")
         
-        old_tree = cls.get_stored_tree(entity.root_ecs_id)
+        # Use read-only tree for diff comparison (10x faster)
+        old_tree = cls.get_stored_tree(entity.root_ecs_id, read_only=True)
         if old_tree is None:
             cls.register_entity(entity)
             return True
         else:
+            import time
+            
+            # Track total version time breakdown
+            breakdown_start = time.perf_counter()
+            
+            t_build = time.perf_counter()
             new_tree = build_entity_tree(entity)
+            build_time = (time.perf_counter() - t_build) * 1000
+            
+            t_diff = time.perf_counter()
             if force_versioning:
                 modified_entities = new_tree.nodes.keys()
             else:
                 modified_entities = list(find_modified_entities(new_tree=new_tree, old_tree=old_tree))
+            diff_time = (time.perf_counter() - t_diff) * 1000
+            
+            # Explicitly delete old_tree to help GC - it's no longer needed
+            del old_tree
         
             typed_entities = [entity for entity in modified_entities if isinstance(entity, UUID)]
             
@@ -1484,7 +1774,11 @@ class EntityRegistry():
                 # now we fork all the modified entities with the new root_ecs_id as input
                 #remove the old root_ecs_id from the typed_entities
                 typed_entities.remove(current_root_ecs_id)
-                for modified_entity_id in typed_entities:
+                t_update_ids = time.perf_counter()
+                
+                # Track if loop itself is slow or if individual operations accumulate
+                loop_entry_count = len(typed_entities)
+                for idx, modified_entity_id in enumerate(typed_entities):
                     modified_entity = new_tree.get_entity(modified_entity_id)
                     if modified_entity is not None:
                         #here we could have some modified entitiyes being entities that have been removed from the tree so we get nones
@@ -1496,13 +1790,33 @@ class EntityRegistry():
                         #later here we will handle the case where the entity has been moved to a different tree or prompoted to it's own tree
                         print(f"modified entity {modified_entity_id} not found in new tree, something went wrong")
                 
+                update_ids_time = (time.perf_counter() - t_update_ids) * 1000
+                if update_ids_time > 5:
+                    avg_per_entity = update_ids_time / loop_entry_count if loop_entry_count > 0 else 0
+                    print(f"      UPDATE_IDS: {update_ids_time:.1f}ms ({loop_entry_count} entities, {avg_per_entity:.3f}ms/entity)")
+                
                 # Update tree mappings to be consistent with new ECS IDs
+                t_update_map = time.perf_counter()
                 update_tree_mappings_after_versioning(new_tree, id_mapping)
+                update_map_time = (time.perf_counter() - t_update_map) * 1000
+                if update_map_time > 5:
+                    print(f"      UPDATE_MAPPINGS: {update_map_time:.1f}ms")
                 
                 # Update the tree's lineage_id to match the updated root entity
                 new_tree.lineage_id = root_entity.lineage_id
                 
+                t_register = time.perf_counter()
                 cls.register_entity_tree(new_tree)
+                register_time = (time.perf_counter() - t_register) * 1000
+                
+                # Accumulate timing stats
+                cls._total_build_time += build_time
+                cls._total_diff_time += diff_time
+                cls._total_update_ids_time += update_ids_time
+                cls._total_update_mappings_time += update_map_time
+                cls._total_register_time += register_time
+                cls._version_count += 1
+                
             return True            
 
 

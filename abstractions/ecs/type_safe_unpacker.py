@@ -252,7 +252,7 @@ class TypeSafeContainerReconstructor:
         
         This maintains backward compatibility while eliminating raw data leakage.
         """
-        print(f"🔧 TYPE-SAFE UNPACKER CALLED: {type(result).__name__}")
+        # print(f"🔧 TYPE-SAFE UNPACKER CALLED: {type(result).__name__}")
         if execution_id is None:
             execution_id = uuid4()
         
